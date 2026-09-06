@@ -1,0 +1,22 @@
+{
+  "name": "football-prediction-platform",
+  "private": true,
+  "packageManager": "pnpm@12.3.4",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "typecheck": "turbo run typecheck",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "py:lint": "uv run ruff check .",
+    "py:typecheck": "uv run mypy",
+    "py:test": "uv run pytest -q",
+    "verify": "pnpm -r typecheck && pnpm -r lint && pnpm py:lint && pnpm py:typecheck && pnpm py:test"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9",
+    "eslint": "^9",
+    "turbo": "^2",
+    "typescript": "^5.6",
+    "typescript-eslint": "^8"
+  }
+}

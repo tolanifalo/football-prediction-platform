@@ -1,0 +1,34 @@
+[project]
+name = "football-prediction-platform"
+version = "0.0.0"
+description = "Workspace root. The engine package lives in apps/engine."
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "mypy>=1.11",
+    "pytest>=8",
+    "ruff>=0.6",
+]
+
+[tool.uv.workspace]
+members = ["apps/engine"]
+
+[tool.uv.sources]
+engine = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["apps/engine/tests"]
+
+[tool.ruff]
+target-version = "py312"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["apps/engine/src"]
+strict = true
