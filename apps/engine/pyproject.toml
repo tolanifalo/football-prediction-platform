@@ -3,7 +3,9 @@ name = "engine"
 version = "0.0.0"
 description = "Ingest, feature building, prediction and value engine."
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "psycopg[binary]>=3.2",
+]
 
 [build-system]
 requires = ["hatchling"]

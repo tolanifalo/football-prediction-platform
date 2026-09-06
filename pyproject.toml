@@ -20,6 +20,9 @@ engine = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["apps/engine/tests"]
+# DB tests need a running container, so they are opt-in. CI runs them with -m db.
+addopts = "-m 'not db'"
+markers = ["db: requires a running Postgres (docker compose up -d)"]
 
 [tool.ruff]
 target-version = "py312"
@@ -27,6 +30,9 @@ extend-exclude = [".venv"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["engine"]
 
 [tool.mypy]
 python_version = "3.12"

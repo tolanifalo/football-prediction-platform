@@ -10,10 +10,16 @@
     "py:lint": "uv run ruff check .",
     "py:typecheck": "uv run mypy",
     "py:test": "uv run pytest -q",
+    "py:test:db": "uv run pytest -m db -q",
+    "db:up": "docker compose up -d --wait",
+    "db:down": "docker compose down",
+    "db:reset": "docker compose down -v && docker compose up -d --wait",
+    "db:check": "pnpm --filter @fpp/db db:check",
     "verify": "pnpm -r typecheck && pnpm -r lint && pnpm py:lint && pnpm py:typecheck && pnpm py:test"
   },
   "devDependencies": {
     "@eslint/js": "^9",
+    "@types/node": "^22",
     "eslint": "^9",
     "turbo": "^2",
     "typescript": "^5.6",

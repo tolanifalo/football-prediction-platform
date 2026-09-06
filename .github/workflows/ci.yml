@@ -5,9 +5,30 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  # CI reaches the service container on the standard port; local compose uses
+  # 5433 to avoid colliding with a host Postgres.
+  DATABASE_URL: postgresql://fpp:fpp_local_dev@localhost:5432/fpp
+
 jobs:
   typescript:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.6-bookworm
+        env:
+          POSTGRES_USER: fpp
+          POSTGRES_PASSWORD: fpp_local_dev
+          POSTGRES_DB: fpp
+          TZ: UTC
+          PGTZ: UTC
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fpp -d fpp"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -18,9 +39,26 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm -r typecheck
       - run: pnpm -r lint
+      - run: pnpm db:check
 
   python:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17.6-bookworm
+        env:
+          POSTGRES_USER: fpp
+          POSTGRES_PASSWORD: fpp_local_dev
+          POSTGRES_DB: fpp
+          TZ: UTC
+          PGTZ: UTC
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U fpp -d fpp"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -30,3 +68,4 @@ jobs:
       - run: uv run ruff check .
       - run: uv run mypy
       - run: uv run pytest -q
+      - run: uv run pytest -m db -q

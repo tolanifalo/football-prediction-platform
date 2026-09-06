@@ -6,6 +6,10 @@
   "main": "src/index.ts",
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "lint": "eslint src"
+    "lint": "eslint src",
+    "db:check": "node src/connection.ts"
+  },
+  "dependencies": {
+    "postgres": "^3.4"
   }
 }

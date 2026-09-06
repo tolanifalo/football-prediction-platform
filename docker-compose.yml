@@ -1,0 +1,35 @@
+# Local development database for Phase 0.
+#
+# Postgres 17 to match the Supabase platform default, so local behaviour and
+# production behaviour do not diverge. Pinned to an exact patch release: an
+# unpinned tag means two developers can silently run different servers.
+#
+# This file is for local development only. It is not a deployment artifact.
+
+services:
+  postgres:
+    image: postgres:17.6-bookworm
+    container_name: fpp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fpp}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fpp_local_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-fpp}
+      # Deterministic collation. Locale drift changes index ordering between
+      # machines, which would make "reproducible" queries anything but.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fpp} -d ${POSTGRES_DB:-fpp}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  postgres-data:

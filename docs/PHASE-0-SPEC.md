@@ -405,6 +405,48 @@ Proves: the entire chain — that the bitemporal history was not mutated, that n
 
 ---
 
+# 7. Development environment
+
+## 7.1 PostgreSQL version — pinned
+
+**The local development database is PostgreSQL 17.6, pinned to the exact patch version.**
+
+- Pin the patch, never a floating `17` or `latest` tag. An unpinned tag means two developers can silently run different servers, and "reproducible" stops meaning anything the first time behaviour differs between them.
+- 17.x is chosen to match the Supabase platform default, so local and production do not diverge on server behaviour.
+- **Production/Supabase compatibility must be verified against this exact version before any deployment.** Supabase's default moves over time; when it does, this pin is updated deliberately, as a recorded decision, and the local database is rebuilt — not left to drift.
+- Raising the pin is a schema-affecting change. Treat it like a migration: verify, then update this section.
+
+## 7.2 Connection and ports
+
+| Setting | Default | Override |
+|---|---|---|
+| Port | **5433** | `POSTGRES_PORT` |
+| Database | `fpp` | `POSTGRES_DB` |
+| User | `fpp` | `POSTGRES_USER` |
+| Password | `fpp_local_dev` (local only, not a secret) | `POSTGRES_PASSWORD` |
+| Full URL | `postgresql://fpp:fpp_local_dev@localhost:5433/fpp` | `DATABASE_URL` |
+
+**The local database listens on 5433, not the PostgreSQL default 5432.** This avoids colliding with a Postgres already installed on the host — a collision that otherwise presents as a confusing authentication failure against the wrong server. `POSTGRES_PORT` overrides it; `DATABASE_URL` overrides the whole connection string and is what CI and containers set.
+
+Server timezone is forced to UTC and the database is initialised with `--locale=C`. Locale drift changes index ordering between machines, which would undermine the reproducibility guarantees in §5.
+
+## 7.3 Which checks need a running database
+
+**`pnpm verify` does not require Docker.** It runs typecheck, lint and the default test suites only. A developer working on TypeScript must not be blocked by a database they are not touching.
+
+Database-dependent tests are marked `db` and **deselected by default** (`addopts = "-m 'not db'"`). They are run explicitly:
+
+```bash
+pnpm db:up          # docker compose up -d --wait
+uv run pytest -m db # or: pnpm py:test:db
+pnpm db:check       # TypeScript round-trip
+pnpm db:reset       # down -v && up: rebuilds a clean database
+```
+
+**CI must run the DB test suite against a real PostgreSQL service** at the pinned version — both the Python `-m db` suite and the TypeScript round-trip. Opt-in tests that no automated job ever runs rot silently, and this suite is the only thing standing between us and a connection layer that quietly stops working.
+
+---
+
 # A. Final architecture
 
 Unchanged from `ARCHITECTURE.md` in shape — three deployables, database as the engine↔app interface, one scoreline matrix deriving all markets. Four amendments:
