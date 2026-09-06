@@ -1,0 +1,542 @@
+# Phase 0 Specification — Provenance, Bitemporality, Providers, Reproducibility
+
+Final pre-implementation document. Supersedes the schema in `ARCHITECTURE.md` §3 and incorporates the corrections from `DECISIONS-01.md` §6.
+Written 2026-09-06. **No application code is written until this is signed off.**
+
+---
+
+# 1. Data provenance and lineage
+
+## 1.1 The chain we must be able to walk
+
+```
+prediction
+  └─ model_version ─── training_run ─── dataset_snapshot ─┐
+  └─ feature_snapshot (data_cutoff, input_manifest_hash)  │
+        └─ [as-of query over bitemporal facts] ───────────┴─→ fact revisions
+              └─ raw_payload (exact bytes)
+                    └─ ingestion_run
+                          └─ data_source
+```
+
+## 1.2 The design decision that makes this affordable
+
+The naive approach enumerates every fact a prediction consumed in a join table. A single prediction reads the last 10 matches for both teams plus league-wide context — call it 200–400 fact rows. At 5,000 fixtures × several model versions that is hundreds of millions of lineage rows carrying almost no information, because the *same* facts are read over and over.
+
+**Instead: lineage is recorded at the feature-snapshot level and proven by reconstruction, not enumeration.**
+
+A feature snapshot stores its `data_cutoff` and an `input_manifest_hash` — the hash of the ordered set of `(table, fact_id, revision)` tuples the feature build actually read. Because the fact tables are bitemporal (§2), the as-of query is deterministic: re-running it at the same cutoff must return the same rows and therefore the same hash. Matching hashes *prove* lineage without storing it.
+
+Enumeration remains available as an opt-in: `feature_snapshot_inputs` is populated only when the model version is flagged `audit_lineage = true`, or for a sampled percentage of predictions. Use it for debugging, not as the default.
+
+This is the whole trick: **store a hash, not a graph. Reconstruct the graph on demand.**
+
+## 1.3 Minimum structures required
+
+**Three columns on every fact revision row** — this is the fact→source edge and there is no substitute for it:
+
+| Column | Purpose |
+|---|---|
+| `source_id` | which provider asserted it |
+| `raw_payload_id` | the exact bytes it was parsed from |
+| `known_at` | when we learned it |
+
+**Five tables:**
+
+1. **`data_sources`** — provider registry. Root of all provenance.
+2. **`ingestion_runs`** — one row per job execution: source, job name, **adapter version**, params, timing, status, counts. The adapter version matters: a parsing bug is a provenance question, and you must be able to find every row a broken adapter produced.
+3. **`raw_payloads`** — the archive. Deduplicated on `(request_signature, body_hash)` with `first_seen_at`, `last_seen_at`, `seen_count`, because polling the same endpoint hourly returns identical bytes most of the time. Store the body compressed; partition monthly.
+4. **`feature_snapshots`** — `data_cutoff`, `feature_set_version`, `features`, `input_manifest_hash`, `completeness`, `missing_fields`.
+5. **`dataset_snapshots`** — the training-set identity: a `spec` (competitions, date range, filters) plus an `as_of` timestamp, a `row_count` and a `content_hash`. **It does not copy the data.** A training set is defined by a query and a point in time; the bitemporal tables make that definition reproducible, and the hash makes it verifiable.
+
+Plus **`training_runs`** joining a model version to its dataset snapshot, hyperparameters and seed (§5).
+
+`feature_snapshot_inputs` is a sixth, optional table — sampled, not universal.
+
+## 1.4 The two questions provenance must answer
+
+- *"Why did the model predict this?"* → `prediction → feature_snapshot → features jsonb`. Immediate, no reconstruction needed.
+- *"Was that input correct, and where did it come from?"* → re-run the as-of query at `data_cutoff`, land on fact revisions, each carrying `raw_payload_id` → the original bytes and the run that fetched them.
+
+If the recomputed manifest hash does not match the stored one, something in the fact history was mutated outside the bitemporal discipline. **That mismatch is the single most important alarm in the system** — it means historical claims can no longer be trusted, and it should page someone.
+
+---
+
+# 2. Bitemporal facts
+
+## 2.1 Three time axes, and which tables need them
+
+| Axis | Column(s) | Meaning |
+|---|---|---|
+| **Valid time** | `occurred_at`, or `valid_from`/`valid_to` | When the fact was true in the football world |
+| **Transaction time — start** | `known_at` | When our system first held this version |
+| **Transaction time — end** | `superseded_at` (NULL = current belief) | When we learned a different version |
+
+**Do not bitemporalise everything.** It costs query complexity on every read. Apply it only where providers actually revise:
+
+| Table | Treatment | Why |
+|---|---|---|
+| `match_results` | **Full bitemporal** | Scores get corrected; matches get awarded or voided |
+| `match_stats` | **Full bitemporal** | xG and detailed stats are routinely revised days later |
+| `fixture_schedule` | **Full bitemporal** | Kickoff, venue and status change constantly |
+| `external_ids` | **Full bitemporal** | Providers merge and reuse IDs |
+| `team_names`, `competition_names` | Valid-time only | These change in the world; we rarely learn them *wrong* |
+| `countries`, `venues`, `bookmakers` | Plain mutable | Reference data. Versioning it buys nothing |
+| `predictions`, `team_ratings` | Append-only + `superseded_at` | Never corrected, only superseded by a newer computation |
+
+## 2.2 Implementation pattern
+
+One table, append-only, with `superseded_at`. Not a separate history table, not range types with exclusion constraints — those are more machinery for the same guarantee.
+
+- Current row: `superseded_at IS NULL`, enforced by a **partial unique index** on the business key.
+- The as-of predicate:
+  ```
+  known_at <= :cutoff AND (superseded_at IS NULL OR superseded_at > :cutoff)
+  ```
+
+**This predicate must never be hand-written.** Wrap it in a SQL function (`fn_as_of(cutoff)`) or a parameterised view per fact table, and make the feature builder physically unable to query the fact tables any other way. Every leakage bug in this system's future is a hand-written variant of that WHERE clause.
+
+**Enforce append-only with column-level grants**, not convention:
+
+```
+GRANT INSERT, SELECT ON match_results TO engine_rw;
+GRANT UPDATE (superseded_at) ON match_results TO engine_rw;
+```
+
+The engine can insert revisions and close old ones. It cannot rewrite a score. Postgres enforces this; no code review can.
+
+## 2.3 Worked example — a result corrected after the match
+
+**Everton vs Liverpool, fixture `F`, kickoff 2026-03-14 15:00Z, full time ≈16:50Z.**
+
+| Time | Event |
+|---|---|
+| `T1` = 2026-03-14 **17:05Z** | Provider reports **2–1**. We ingest. |
+| `T2` = 2026-03-15 **03:00Z** | Nightly `rebuild_ratings` + `generate_predictions` run with `data_cutoff = T2`. Predictions written for the following weekend. |
+| `T3` = 2026-03-16 **11:20Z** | Provider corrects the score to **2–2** (a goal was wrongly disallowed in their feed). |
+| `T4` = 2026-03-17 **03:00Z** | Next nightly run, `data_cutoff = T4`. |
+
+**Rows in `match_results` after T3** — note that nothing was overwritten:
+
+| revision | ft_home | ft_away | occurred_at | known_at | superseded_at | source | raw_payload |
+|---|---|---|---|---|---|---|---|
+| 1 | 2 | 1 | 2026-03-14 16:50Z | **T1** | **T3** | S1 | P1 |
+| 2 | 2 | 2 | 2026-03-14 16:50Z | **T3** | NULL | S1 | P2 |
+
+Both revisions share the same `occurred_at` — the match happened once. They differ on transaction time, which is exactly the distinction that makes the backtest honest.
+
+**Query 1 — "what did we know at T2?"** (reproducing the prediction)
+`known_at <= T2 AND (superseded_at IS NULL OR superseded_at > T2)`
+Revision 1 qualifies (`T1 ≤ T2` ✓, `T3 > T2` ✓). Revision 2 is excluded (`T3 > T2`).
+→ **2–1.** The feature snapshot from T2 reproduces exactly, hash and all.
+
+**Query 2 — "what is true now?"**
+`superseded_at IS NULL` → **2–2.**
+
+**Consequences, in order:**
+
+1. **The prediction made at T2 is not recomputed.** It was an honest claim given what we knew. Rewriting it would be falsifying the record.
+2. **Predictions on fixture `F` itself must be re-settled.** Every `prediction_market` settled against 2–1 is now wrong. Insert *new* `prediction_outcomes` rows with their own `known_at`; supersede the old ones. Never update in place.
+3. **`model_performance` is recomputed** for affected periods — again as new rows.
+4. **An alert fires:** *"Result correction on fixture F: 2–1 → 2–2. 47 prediction_markets re-settled. Model v1.2 accuracy for 2026-W11 revised from 54.1% to 53.8%."* Silent corrections are precisely how a published accuracy figure quietly becomes a lie.
+5. **Ratings are not retro-patched.** The T2 rating rows used 2–1 and remain as historical fact. The T4 run recomputes forward with 2–2.
+
+## 2.4 The asymmetry rule — features as-of cutoff, outcomes as-of now
+
+This is subtle and gets it wrong in most hobby systems:
+
+| Purpose | Which revision to read |
+|---|---|
+| Reproducing a past prediction | **As-of that prediction's `data_cutoff`** |
+| Building features for a backtest of a *new* model | **As-of the historical cutoff** — a live model would only have had the wrong value, so using the corrected one is a look-ahead leak |
+| Settling outcomes / evaluating accuracy | **Latest known truth** — that is what actually happened |
+
+Backtesting a new model on corrected data inflates results in a way that never shows up as an obvious bug. The `input_manifest_hash` check in §1.2 is what catches it.
+
+---
+
+# 3. Provider bake-off
+
+**Sportmonks is not selected.** The recommendation in `DECISIONS-01` was a starting hypothesis based on published terms and pricing. This section replaces it with measurement.
+
+## 3.1 Test competition — EFL Championship, season 2023/24
+
+Deliberately **not** the Premier League. Every provider covers the Premier League immaculately, so it discriminates nothing. The Championship is the right probe because:
+
+- 24 teams, 552 league matches — a large enough sample for meaningful rates.
+- Mid-tier coverage, where providers actually differ.
+- **Play-offs include two-legged ties** — directly exercises the identity model from §6.
+- Promotion and relegation churn the team set across seasons, exercising entity resolution.
+- The season is complete, so ground truth is stable.
+
+Add one **stretch competition** if a provider claims broad coverage — a second-tier league outside the big five — but score only the Championship. The stretch league is pass/fail on coverage existing at all.
+
+## 3.2 Establishing ground truth
+
+We have no oracle, so we build one:
+
+1. Harvest the season from **every candidate provider plus at least one free reference** (football-data.co.uk results, football-data.org).
+2. Build a consensus by majority vote per field.
+3. **Manually adjudicate every disagreement.** There will be few — likely tens, not thousands — and they are the entire point of the exercise. A field where three providers disagree is a field none of them can be trusted on.
+4. Freeze the adjudicated set as `bakeoff_ground_truth`, versioned and committed.
+
+Manual adjudication of a few dozen cells is a couple of hours of work and produces the only trustworthy scoring baseline available.
+
+## 3.3 Objective metrics
+
+Every metric is a number computed by a script, not a judgement.
+
+| Dimension | Metric | Definition |
+|---|---|---|
+| **Fixtures — recall** | % | ground-truth fixtures present in provider feed |
+| **Fixtures — precision** | % | provider fixtures that correspond to a real fixture (catches phantoms and duplicates) |
+| **Results — FT** | % | exact full-time score match |
+| **Results — HT** | % | exact half-time score match |
+| **Kickoff accuracy** | % / % | within ±0 min; within ±15 min |
+| **Kickoff offset hygiene** | % | datetimes carrying an explicit UTC offset (see §6 rule 11) |
+| **Team identity — completeness** | count | distinct teams reported vs 24 expected |
+| **Team identity — resolvability** | % | auto-resolved to canonical without human input |
+| **Team identity — stability** | count | provider team IDs that changed between pull 1 and pull 2 |
+| **Competition identity** | pass/fail + count | correct competition and season labelling; ID stable across pulls |
+| **Stats fill rate** | % per field | non-null shots, SOT, corners, cards, possession, fouls |
+| **Stats plausibility** | % | rows passing bounds: `shots ≥ SOT ≥ goals`, possession pair sums to 100 ±1, cards ≤ 11 |
+| **xG availability** | % | fixtures with non-null team xG |
+| **xG sanity** | ratio | `Σ xG / Σ goals` across the season — should sit near 1.0; a value far off indicates a broken or differently-scoped model |
+| **xG agreement** | correlation | Pearson r against another provider's xG on shared fixtures |
+| **Lineups** | % / % | fixtures with 11+11 starters; with formation |
+| **Events** | % / % | fixtures where goal events reconcile to the final score; events carrying a minute |
+| **Historical depth** | count | seasons of this competition actually retrievable (**verified by fetching, not by the docs**) |
+| **Update latency** | median, p95 | minutes from full time to result available — measured prospectively over ≥20 live matches |
+| **Corrections / silent revision** | count | cells differing between pull 1 and pull 2, taken **14 days apart on the same completed season** |
+| **Correction transparency** | pass/fail | does anything in the payload flag that a revision occurred? |
+| **API reliability** | % / ms | success rate; p50 and p95 latency; 5xx rate across the whole harvest |
+| **Backfill cost** | count | API calls consumed to harvest one full season — the real cost driver |
+
+## 3.4 The test that decides it
+
+**Pull the same completed season twice, fourteen days apart, and diff every cell.**
+
+A completed season from 2023/24 must not change. Any cell that does is a silent revision of settled history. A provider that silently rewrites the past cannot support honest backtesting no matter how good its coverage is, because your point-in-time reconstruction will disagree with theirs and you will never know which is right.
+
+Score: 5 = zero changed cells; 3 = changes present but flagged in the payload; 0 = unflagged changes to scores or fixtures.
+
+## 3.5 Scoring and gates
+
+Apply the Tier-1 gates from `DECISIONS-01.md` §2 first — a vendor failing any of them is out regardless of score. Then normalise each metric to 0–5 and apply the Tier-2 weights.
+
+Two override rules:
+
+- **Any provider scoring 0 on silent revision is disqualified as *primary*.** It may still serve as a cross-validation second source.
+- **Fixture precision below 99% is disqualifying.** Phantom and duplicate fixtures poison entity resolution permanently, and no amount of stats depth compensates.
+
+## 3.6 The bake-off *is* Phase 0's integration test
+
+Run it through the real ingest pipeline: real `ProviderAdapter` implementations, real `raw_payloads`, real entity resolution, real reconciliation. It simultaneously selects the provider and proves the architecture works end to end. Do not build it as a throwaway script.
+
+**Output:** a committed `docs/BAKEOFF-RESULTS.md` with the scorecard, the adjudicated disagreements, and a dated decision with reasons.
+
+---
+
+# 4. Odds data model
+
+Modelled separately from football data, sharing only `fixture_id`.
+
+## 4.1 Structure
+
+**`bookmakers`** — `id, slug, name, kind ('bookmaker' | 'exchange' | 'aggregator'), country_scope, commission_rate` (exchanges only), `sharpness_tier`.
+Exchanges are not bookmakers: their prices are net of commission and their liquidity is a signal in itself. The `kind` column keeps every downstream calculation honest about that.
+
+**`odds_series`** — the identity of a price series, stored **once**:
+`id, fixture_id, bookmaker_id, period ('ft'|'ht'|'2h'), market_type, line numeric NULL, selection`
+`UNIQUE (fixture_id, bookmaker_id, period, market_type, line, selection)`
+
+`period` was missing from the v1 schema and is not optional — half-time markets are a different market with the same `market_type` label.
+
+**`odds_ticks`** — append-only, **one row only when the price or availability changes**:
+`series_id, observed_at, price numeric, is_available boolean, source_id, raw_payload_id`
+
+**`odds_coverage`** — `fixture_id, source_id, first_polled_at, last_polled_at, poll_count`.
+Without this, a gap in ticks is ambiguous between "price didn't move" and "we weren't looking". That distinction matters enormously when reconstructing a market.
+
+## 4.2 Why this shape
+
+The v1 flat `odds_snapshots` table repeated the whole `(fixture, bookmaker, market, line, selection)` tuple on every row. Normalising the series out and recording only changes attacks the storage problem from both directions:
+
+- Series normalisation: a tick is `(bigint, timestamptz, numeric, bool, ...)` ≈ 30 bytes instead of ≈ 120.
+- Change-only recording: prices are static between moves, so 80–95% of polls write nothing.
+
+Together this turns the ~15–20 GB/year projection from `DECISIONS-01` §6.1 into something in the low single-digit GB, **losslessly** — every price at every instant is still recoverable by step-function interpolation between ticks, bounded by `odds_coverage`.
+
+## 4.3 Closing prices — naming discipline
+
+**A price is only `closing` if the source defines it as closing.** Three distinct things must never share a column:
+
+| `price_kind` | Meaning | Sources |
+|---|---|---|
+| `provider_closing` | The source publishes an explicit closing price | football-data.co.uk `C`-suffixed columns |
+| `exchange_sp` | Betfair Starting Price — a real transacted settlement price | Betfair |
+| `last_observed_pre_kickoff` | **Our own last observation before kickoff. Not a closing price.** | Our polling |
+
+Stored on `odds_series` as `reference_price`, `reference_price_kind`, `reference_captured_at`.
+
+Two rules:
+
+- The `last_observed_pre_kickoff` capture is triggered by the fixture status transitioning to `live`, **not by the scheduled kickoff time** — otherwise a rescheduled match captures a price hours early.
+- Any CLV computed against `last_observed_pre_kickoff` must be **labelled an approximation everywhere it is displayed or stored**. Only the first two kinds are true CLV.
+
+## 4.4 Calculations
+
+**Implied probability.** Decimal price `d` → `p_raw = 1/d`.
+For an exchange with commission `c`, the price is gross but the return is not: effective return on a winning unit stake is `1 + (d−1)(1−c)`. Use the gross price for probability and apply commission in EV, never both or neither.
+
+**Overround.** For the set of mutually exclusive selections in one market: `overround = Σ (1/dᵢ)`. Margin = `overround − 1`. Two-way at 1.90/1.90 → `0.5263 × 2 = 1.0526`, a 5.26% margin.
+
+**De-vigging.** Four methods, and the choice is empirical, not theoretical:
+
+1. **Multiplicative** — `pᵢ = p_rawᵢ / Σp_raw`. The naive default; assumes margin scales with probability.
+2. **Additive** — `pᵢ = p_rawᵢ − (Σp_raw − 1)/n`. Assumes margin is spread equally.
+3. **Shin** — solves for an insider-trading parameter `z`; empirically better on favourite–longshot bias.
+4. **Power** — find `k` such that `Σ p_rawᵢ^k = 1`. Often the best empirical fit.
+
+**Store raw prices only. De-vig at analysis time and record the method used** in `market_consensus.method`. Which method works best depends on your specific book mix and is a Phase 4 experiment, not a Phase 0 decision. Baking one in now is a decision you cannot revisit.
+
+**Market consensus.** Four rules, each of which is a real bug if broken:
+
+- Group by exact `(period, market_type, line)`. **Never average across lines** — a 2.5 total and a 2.75 total are different questions.
+- **De-vig each bookmaker individually first, then aggregate.** Averaging raw prices and de-vigging the average is wrong, because books carry different margins.
+- **Aggregate in log-odds space**, then renormalise. Averaging probabilities compresses everything toward 0.5.
+- **Exclude stale and suspended series** — no tick within N minutes, or `is_available = false`. A suspended market's last price is the least informative number in the dataset, and suspensions cluster at exactly the moments that matter.
+
+Weighting: begin with the sharpest single available book as the consensus. It is simpler than a weighted mean and usually more accurate. Move to weights derived from observed CLV performance only once you have the data to fit them.
+
+**Model edge.** `edge = p_model − p_market_fair`. Also report relative edge `p_model / p_market_fair − 1`, because a 2-point edge means something very different at 5% than at 50%.
+
+**Expected value.** Against the **best available price** `d_best`, not the consensus — the consensus is the truth estimate, the best price is what you can actually take:
+`EV = p_model × d_best − 1` per unit stake.
+On an exchange: `EV = p_model × (d_best − 1)(1 − c) − (1 − p_model)`.
+
+**Kelly.** `f* = (p_model × d − 1) / (d − 1)`, i.e. `edge / (d − 1)`.
+Store the full-Kelly fraction; **display and recommend a quarter of it, capped.** Kelly is extraordinarily sensitive to error in `p_model` — full Kelly on a model that is 3 points overconfident is a ruin strategy. This is why calibration matters more than accuracy for this product.
+
+**CLV.** Evaluate the price you took against the closing fair probability:
+`CLV = (d_taken × p_close_fair) − 1`
+Positive means you beat the close. Always store `reference_price_kind` alongside, so the number is interpretable — and never present CLV computed from `last_observed_pre_kickoff` as equivalent to CLV against a true closing line.
+
+## 4.5 Known blind spot, recorded deliberately
+
+We capture price but not **stake limits**. At the margin, limits determine whether an edge is real — a 6% edge available for £5 is noise. Record this as accepted and unresolved; do not let it be discovered later as a surprise.
+
+---
+
+# 5. Model reproducibility
+
+## 5.1 What must be stored
+
+**`model_versions`**
+
+| Field | Why |
+|---|---|
+| `name`, `semver`, `algorithm` | Identity |
+| `code_git_sha` | Exact commit |
+| `code_tree_clean` boolean | **A dirty working tree may never reach `active`.** A SHA does not identify uncommitted code |
+| `env_lock_hash` | Hash of `uv.lock` — numpy and scipy change results at the margin between versions |
+| `container_image_digest` | The sha256 of the image, not a mutable tag |
+| `feature_set_version` | Which feature builder produced its inputs |
+| `hyperparams` jsonb | Complete, including defaults — never rely on a library's default staying constant |
+| `random_seed` int | |
+| `artifact_uri`, `artifact_sha256` | The fitted parameters, and proof they haven't changed |
+| `training_run_id` | |
+| `status`, `created_at` | |
+
+**`training_runs`** — `model_version_id`, `dataset_snapshot_id`, `started_at`, `finished_at`, `thread_count`, `env_vars` jsonb, `metrics` jsonb, `log_uri`.
+
+**`dataset_snapshots`** — `spec` jsonb (competitions, date range, filters, minimum-match thresholds), **`as_of`** (the bitemporal cutoff — the single most important field), `row_count`, `content_hash`.
+
+**`feature_snapshots`** — `fixture_id`, `model_version_id`, `feature_set_version`, **`data_cutoff`**, `features` jsonb, `input_manifest_hash`, `completeness`, `missing_fields`, `computed_at`.
+
+**`predictions`** — `feature_snapshot_id`, `model_version_id`, `computed_at` (the prediction timestamp), outputs, `output_hash`, `superseded_at`.
+
+## 5.2 Determinism hazards to control
+
+The obvious ones are seeds and versions. These are the ones that actually bite:
+
+| Hazard | Control |
+|---|---|
+| BLAS/OpenMP thread count changes floating-point reduction order | `OMP_NUM_THREADS=1`, recorded in `training_runs.thread_count` |
+| SQL without `ORDER BY` returns rows in arbitrary order, changing summation order | Mandatory `ORDER BY` in every feature and training query; enforced by review and a lint rule |
+| Python hash randomisation affects dict/set iteration | `PYTHONHASHSEED=0` |
+| Machine timezone leaking into date arithmetic | Container forced to UTC |
+| Library minor-version drift | Lockfile hash pinned and recorded |
+| Mutable image tags | Pin by digest |
+
+## 5.3 The reproduction test — two levels
+
+**L1 — Replay.** Re-run the stored `model_version` against the *stored* `feature_snapshot`. Output must match `output_hash` to within 1e-9.
+Proves: the model artifact and code are intact.
+
+**L2 — Rebuild.** Re-run the as-of feature query at `data_cutoff`, recompute `input_manifest_hash`, compare; then run the model on the rebuilt features and compare to stored outputs.
+Proves: the entire chain — that the bitemporal history was not mutated, that no leakage was introduced, and that a six-month-old prediction can be regenerated from source.
+
+**L1 must pass for every prediction, always. L2 runs nightly on a sample and in full before any model promotion.** An L2 failure with an L1 pass means the fact history changed underneath us — that is the §1.4 alarm.
+
+`reproduce.py --prediction-id X` implements both and prints a verdict. **Build the harness in Phase 0 against a placeholder model**, while it is cheap. Proving reproducibility after you have a real model and six months of predictions is enormously harder.
+
+---
+
+# 6. Database stress test — concrete schema rules
+
+| # | Case | Rule |
+|---|---|---|
+| **1** | **Rescheduled fixtures** | Identity key **excludes kickoff time**. Schedule lives in bitemporal `fixture_schedule(fixture_id, kickoff_utc, local_date, local_tz, venue_id, status, known_at, superseded_at)`. A kickoff move of **>24h supersedes all predictions** for that fixture with `reason = 'reschedule'`. |
+| **2** | **Postponed fixtures** | Status `postponed`. The replayed match is the **same `fixture_id`** with a new `fixture_schedule` revision — never a new fixture. Postponement does not break identity. |
+| **3** | **Abandoned fixtures** | Status `abandoned`. No trainable result: `match_results.is_trainable = false`. If a federation **awards** a score, `result_source = 'awarded'` and `is_trainable = false` — awarded scores are administrative outcomes and must never train the goals model. They still settle bets. |
+| **4** | **Replayed fixtures** | A replay from 0–0 is a **new fixture row** with `replaces_fixture_id`. Identity: `UNIQUE (season_id, stage, leg, replay_number, home_team_id, away_team_id)`. |
+| **5** | **Two-legged ties** | `stage` and `leg` are part of the identity key, so the same pair meeting twice in a season is legal. `tie_id` groups the legs and is where aggregate-score logic lives. `leg ∈ {1,2}`, `tie_id` non-null only for two-legged ties. |
+| **6** | **Renamed competitions** | `competition_names(competition_id, name, name_type ∈ {official, sponsored, short}, valid_from, valid_to)`. Canonical name is **sponsor-free**. Render the name valid at the fixture's `local_date`. `seasons.format` jsonb describes structure — **no code may assume a group stage exists.** |
+| **7** | **Renamed teams** | `team_names(team_id, name, name_type, valid_from, valid_to, source_id)`. **`teams` has no name column at all** — removing it makes the correct behaviour the only possible behaviour. Historical pages render the name valid at match date. |
+| **8** | **Dissolved / recreated clubs** | `teams.status ∈ {active, dissolved, merged}`, `succeeded_by_team_id`, `continuity ∈ {legal, sporting, none}`. A phoenix club is a **new `team_id` by default**; asserting statistical continuity is an explicit, recorded, reversible decision. **Never delete a team row** — tombstone it. |
+| **9** | **Provider ID changes** | `external_ids` is bitemporal with `confidence` and `last_verified_at`. A nightly job re-checks the provider's current name for each mapped ID against our alias set; a mismatch drops confidence and files a review item. **Never auto-remap.** |
+| **10** | **Duplicate provider records** | Many external IDs → one internal ID is legal and expected. One external ID → two internal IDs is blocked by `UNIQUE (source_id, entity_type, external_id)` where `superseded_at IS NULL`. Cross-provider duplicates go to `fixture_match_candidates`, scored on (teams, ±3 days, competition), and are **never auto-merged when ambiguous**. |
+| **11** | **Timezones** | Store `kickoff_utc timestamptz` + `local_date date` + `local_tz` (IANA). **Reject any ingested datetime lacking an explicit UTC offset** — never infer one. `local_date` is computed and stored at ingest, not generated, because a competition's timezone can itself change. DST is handled automatically by storing instants; the hazard is providers sending wall-clock time, which the rejection rule catches. |
+| **12** | **Missing data** | `competition_coverage(competition_id, season_id, field, availability ∈ {always, partial, never}, verified_at)`. NULL means "not provided" and **no sentinel value is ever substituted**. Models declare `required_features`; a fixture whose coverage cannot satisfy them **receives no prediction rather than a silently degraded one**. |
+| **13** | **Late-arriving data** | `fixtures.stats_complete_at` is set when every field the coverage profile marks `always` is present. Rating jobs are **watermark-driven** — they process fixtures where `stats_complete_at > last_watermark`, never `date = yesterday`. Late data moves ratings forward and never retro-edits a published prediction. |
+| **14** | **Corrected data** | Bitemporal insert-and-supersede. `UPDATE` is forbidden on fact tables except to set `superseded_at`, enforced by **column-level GRANT**. Every correction re-settles affected outcomes as new rows and raises an alert naming the counts. |
+| **15** | **Odds price changes** | A tick is written **iff** `(price, is_available)` differs from the series' latest tick. `odds_coverage` records polling windows so that an absence of ticks is interpretable rather than ambiguous. |
+
+---
+
+# A. Final architecture
+
+Unchanged from `ARCHITECTURE.md` in shape — three deployables, database as the engine↔app interface, one scoreline matrix deriving all markets. Four amendments:
+
+1. **Provenance is a first-class layer**, not metadata. Every fact carries `source_id`, `raw_payload_id`, `known_at`; lineage is proven by hash reconstruction rather than stored as a graph.
+2. **Bitemporality is scoped to four fact tables**, with the as-of predicate encapsulated in a function and append-only enforced by column grants.
+3. **Odds are a separate normalised model** — `odds_series` + `odds_ticks` + `odds_coverage` — with strict naming discipline separating true closing prices from our own last observation.
+4. **Reproducibility is a Phase 0 deliverable**, built against a placeholder model, not a Phase 7 aspiration.
+
+# B. Final schema
+
+**Provenance** — `data_sources`, `ingestion_runs`, `raw_payloads` (partitioned monthly, deduped on `request_signature + body_hash`), `external_ids` (bitemporal), `job_runs`.
+
+**Canonical** — `countries`, `competitions`, `competition_names`, `seasons` (with `format`), `teams` (**no name column**), `team_names`, `team_aliases`, `venues`, `competition_coverage`.
+
+**Fixtures** — `fixtures` (identity: `season_id, stage, leg, replay_number, home_team_id, away_team_id`; plus `tie_id`, `replaces_fixture_id`, `stats_complete_at`), `fixture_schedule` (bitemporal).
+
+**Facts** — `match_results` (bitemporal, `is_trainable`, `result_source`), `match_stats` (bitemporal), `match_events` (deferred to Phase 8, schema reserved).
+
+**Odds** — `bookmakers`, `odds_series` (with `reference_price`, `reference_price_kind`), `odds_ticks`, `odds_coverage`.
+
+**Model** — `model_versions`, `training_runs`, `dataset_snapshots`, `feature_snapshots`, `feature_snapshot_inputs` (sampled), `predictions`, `prediction_markets`, `team_ratings`.
+
+**Evaluation** — `prediction_outcomes` (bitemporal), `model_performance`.
+
+**Review queues** — `entity_review_queue`, `fixture_match_candidates`.
+
+**Application** — deferred entirely to Phase 5. Not built in Phase 0.
+
+# C. Provider bake-off plan
+
+Championship 2023/24 · consensus ground truth with manual adjudication of disagreements · the metric table in §3.3 · **two pulls fourteen days apart** as the deciding test · Tier-1 gates then weighted scoring · disqualification on unflagged silent revision or sub-99% fixture precision · run through the real pipeline · results committed to `docs/BAKEOFF-RESULTS.md` with a dated decision.
+
+# D. Phase 0 task list, in dependency order
+
+| # | Task | Depends on |
+|---|---|---|
+| **P0-01** | Monorepo skeleton: pnpm workspaces, Turbo, `apps/web` (empty), `apps/engine`, `packages/db`; CI running lint + typecheck | — |
+| **P0-02** | Local Postgres via Docker Compose; connection from both TS and Python | 01 |
+| **P0-03** | Drizzle harness: config, `generate` + `migrate` scripts, **one `--custom` SQL migration and one `tablesFilter` exclusion proven end to end** | 02 |
+| **P0-04** | Provenance core: `data_sources`, `ingestion_runs`, `raw_payloads` (monthly partitions — the partition proof), `job_runs` | 03 |
+| **P0-05** | Canonical entities: countries, competitions, `competition_names`, seasons, teams (no name column), `team_names`, aliases, venues | 03 |
+| **P0-06** | `external_ids` (bitemporal) + `entity_review_queue` | 04, 05 |
+| **P0-07** | Fixture identity: `fixtures` + `fixture_schedule` (bitemporal), ties, legs, replays | 05 |
+| **P0-08** | Bitemporal facts: `match_results`, `match_stats`, the `as_of` SQL function, and **column-level grants** | 04, 07 |
+| **P0-09** | Odds model: `bookmakers`, `odds_series`, `odds_ticks`, `odds_coverage` | 04, 07 |
+| **P0-10** | `ProviderAdapter` interface + canonical DTOs + an adapter contract test suite any adapter must pass | 04 |
+| **P0-11** | Adapter #1 — football-data.co.uk CSV (results **and** odds; free, no key, exercises the whole pipeline) | 10 |
+| **P0-12** | Entity resolution: alias matching, fuzzy candidates, review queue population | 06, 11 |
+| **P0-13** | Historical import: 3 leagues × 5 seasons of results and odds, with full provenance | 08, 09, 12 |
+| **P0-14** | Validation and reconciliation suite: data-quality assertions + cross-source reconciliation | 13 |
+| **P0-15** | Reproducibility harness: `dataset_snapshots`, `model_versions`, `training_runs`, `feature_snapshots`, `reproduce.py` with **L1 and L2 against a placeholder model** | 08 |
+| **P0-16** | DB roles (`app_rw`, `engine_rw`, `analytics_ro`) with explicit grants; RLS scaffolding on the (empty) user tables | 08, 09 |
+| **P0-17** | Bake-off harness + first pull of Championship 2023/24 from every candidate | 11, 14 |
+| **P0-18** | **Second bake-off pull, 14 days later**, diff, scorecard, decision | 17 + 14 days |
+
+Phase 0 ends at P0-18, not P0-17. **The waiting period is part of the plan** — start the clock on P0-17 early and do P0-15/16 while it runs.
+
+# E. Acceptance criteria
+
+| Task | Accepted when |
+|---|---|
+| P0-01 | CI green on an empty repo; `pnpm -r typecheck` and `uv run pytest` both exit 0 |
+| P0-02 | Both a TS and a Python process connect and round-trip a query; `docker compose down -v && up` reproduces a clean DB |
+| P0-03 | `drizzle-kit generate` on unchanged schema produces an **empty diff**; a custom SQL migration applies; a `tablesFilter`-excluded table is untouched by generate |
+| P0-04 | A payload inserted twice yields **one row** with `seen_count = 2`; partitions exist for the current and next month; a partition drop leaves other data intact |
+| P0-05 | A team can be renamed and both the historical and the current name resolve correctly at their respective dates; `teams` has no name column |
+| P0-06 | An external ID remapped to a different internal entity leaves the old mapping intact with `superseded_at` set; the as-of query returns the old mapping for a past cutoff |
+| P0-07 | Both legs of a two-legged tie insert without violating the unique constraint; a replay inserts as a new fixture linked by `replaces_fixture_id`; a reschedule creates a schedule revision, **not** a duplicate fixture |
+| P0-08 | **The §2.3 worked example passes as an automated test** — insert 2–1, insert the 2–2 correction, and assert the as-of query at T2 returns 2–1 while the current query returns 2–2. An `UPDATE` on a score column is **rejected by the database** for `engine_rw` |
+| P0-09 | Polling an unchanged price twice writes **one** tick; a suspension writes a tick with `is_available = false`; `odds_coverage` distinguishes "not polled" from "unchanged" |
+| P0-10 | The contract test suite runs against a stub adapter and fails it for each of: provider shape leakage, missing `known_at`, absent raw payload persistence |
+| P0-11 | The adapter passes the contract suite; every ingested row traces to a `raw_payload_id`; re-running the import is idempotent (row counts unchanged) |
+| P0-12 | ≥95% of teams auto-resolve; every unresolved team appears in the review queue; **zero teams are silently auto-created** |
+| P0-13 | Row counts match the source CSVs; every fact row has non-null `source_id`, `raw_payload_id`, `known_at`; spot-check of 20 fixtures against the source is exact |
+| P0-14 | Every assertion from `ARCHITECTURE.md` §7 runs and passes; a deliberately corrupted row is caught and quarantined rather than published |
+| P0-15 | **L1 passes bit-for-bit** on the placeholder model; **L2 passes**; mutating a historical fact makes L2 fail with a clear message |
+| P0-16 | `app_rw` cannot write engine tables and `engine_rw` cannot write app tables — both proven by tests that expect a permission error |
+| P0-17 | One full season harvested from each candidate through the real pipeline, all payloads archived |
+| P0-18 | Scorecard produced; disagreements adjudicated; `docs/BAKEOFF-RESULTS.md` committed with a dated, reasoned decision |
+
+# F. Verification commands
+
+```bash
+# Environment
+docker compose up -d && docker compose ps
+pnpm install && uv sync
+
+# Schema integrity — the empty-diff check is the drift alarm
+pnpm db:migrate
+pnpm db:generate          # must produce an empty diff
+pnpm db:verify-partitions
+
+# Static checks
+pnpm -r typecheck && pnpm -r lint
+uv run ruff check . && uv run mypy src
+
+# Tests
+pnpm -r test
+uv run pytest -q
+uv run pytest tests/bitemporal -v      # the §2.3 worked example
+uv run pytest tests/adapters  -v       # adapter contract suite
+uv run pytest tests/grants    -v       # permission boundaries
+
+# Data integrity
+uv run python -m engine.jobs.validate --all
+uv run python -m engine.jobs.reconcile --competition championship --season 2023-24
+
+# Reproducibility
+uv run python -m engine.reproduce --prediction-id <id> --level L1
+uv run python -m engine.reproduce --prediction-id <id> --level L2
+
+# Bake-off
+uv run python -m engine.bakeoff harvest  --competition championship --season 2023-24
+uv run python -m engine.bakeoff diff     --pull-a 1 --pull-b 2
+uv run python -m engine.bakeoff scorecard
+```
+
+A single `pnpm verify` should chain the static checks, both test suites and the validation run.
+
+# G. Must NOT be implemented in Phase 0
+
+- **Any frontend.** `apps/web` exists as an empty workspace with a typecheck script and nothing else. No pages, no components, no API routes.
+- **Any prediction model.** The placeholder in P0-15 returns a constant. It exists to prove the reproducibility harness, and its constancy is the point.
+- **The bet-slip wizard**, in any form.
+- **User accounts, auth, Stripe, entitlements, RLS policies with actual rules.** P0-16 creates the roles and empty tables only.
+- **Live or in-play anything.** No pollers, no Realtime, no `match_events` population.
+- **A paid provider integration.** Free sources only until P0-18 decides.
+- **The value engine** — no de-vigging, no consensus, no edge. Odds are stored, not interpreted.
+- **Player-level data, lineups, injuries.** Schema space reserved; nothing built.
+- **Deployment to Vercel, Fly or Supabase.** Phase 0 is local-only. Cloud comes with Phase 1.
+- **Scheduling and cron.** Jobs are invoked manually by command in Phase 0.
+- **`packages/ui` and `packages/contracts`.** No second consumer exists yet.
+
+The temptation in Phase 0 is to build something visible. Resist it: **Phase 0's deliverable is a trustworthy database with proven provenance, and nothing else.** Everything visible is Phase 3.
