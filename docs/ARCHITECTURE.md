@@ -133,8 +133,8 @@ Grouped by owning layer. `timestamptz` everywhere, stored UTC.
 |---|---|---|
 | `data_sources` | id, slug, kind (`fixtures`/`odds`/`stats`), base_url, rate_limit, active | Provider registry |
 | `external_ids` | source_id, entity_type, external_id, internal_id · UNIQUE(source_id, entity_type, external_id) | **One polymorphic table, not one per entity.** Provider IDs never become primary keys |
-| `raw_payloads` | source_id, endpoint, params, body `jsonb`, body_hash, fetched_at | Append-only landing zone, partitioned monthly. Lets you re-derive everything without re-fetching |
-| `ingestion_runs` | source_id, job, started_at, finished_at, status, rows_in/out, error | Feeds the admin status page |
+| `raw_payloads` | source_id, endpoint, params, body `jsonb`, body_hash, fetched_at | Append-only landing zone, partitioned monthly. Lets you re-derive everything without re-fetching — **[SUPERSEDED 2026-09-07]** the archive is now two tables: unpartitioned `raw_payload_bodies` (content, globally deduped on `hash_algo + body_hash`) and partitioned `raw_payloads` (one row per fetch). PostgreSQL cannot put a global unique constraint on a partitioned table, nor accept a single-column FK to one. Authoritative: **`PHASE-0-SPEC.md` §9.1**. |
+| `ingestion_runs` | source_id, job, started_at, finished_at, status, rows_in/out, error | Feeds the admin status page — **[SUPERSEDED 2026-09-07]** not built. `job_runs` absorbs this: one row per invocation of one job against one source, with nullable `source_id` and `adapter_version`. Authoritative: **`PHASE-0-SPEC.md` §9.2**. |
 
 ### 3.2 Canonical football data
 

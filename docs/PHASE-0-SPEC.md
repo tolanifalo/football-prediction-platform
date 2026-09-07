@@ -14,9 +14,10 @@ prediction
   └─ model_version ─── training_run ─── dataset_snapshot ─┐
   └─ feature_snapshot (data_cutoff, input_manifest_hash)  │
         └─ [as-of query over bitemporal facts] ───────────┴─→ fact revisions
-              └─ raw_payload (exact bytes)
-                    └─ ingestion_run
-                          └─ data_source
+              └─ raw_payload_bodies (exact bytes)
+                    └─ raw_payloads (the fetch that observed them)
+                          └─ job_runs
+                                └─ data_sources
 ```
 
 ## 1.2 The design decision that makes this affordable
@@ -38,14 +39,14 @@ This is the whole trick: **store a hash, not a graph. Reconstruct the graph on d
 | Column | Purpose |
 |---|---|
 | `source_id` | which provider asserted it |
-| `raw_payload_id` | the exact bytes it was parsed from |
+| `raw_payload_body_id` | the exact bytes it was parsed from — a single-column FK to the unpartitioned `raw_payload_bodies` (§9.1) |
 | `known_at` | when we learned it |
 
-**Five tables:**
+**Five tables** *(amended 2026-09-07 — the raw-ingestion tables are specified in full in §9; that section governs)*:
 
 1. **`data_sources`** — provider registry. Root of all provenance.
-2. **`ingestion_runs`** — one row per job execution: source, job name, **adapter version**, params, timing, status, counts. The adapter version matters: a parsing bug is a provenance question, and you must be able to find every row a broken adapter produced.
-3. **`raw_payloads`** — the archive. Deduplicated on `(request_signature, body_hash)` with `first_seen_at`, `last_seen_at`, `seen_count`, because polling the same endpoint hourly returns identical bytes most of the time. Store the body compressed; partition monthly.
+2. **`job_runs`** — one row per invocation of one job against one source: job name, scope, source, **adapter version**, params, timing, status, counts. The adapter version matters: a parsing bug is a provenance question, and you must be able to find every row a broken adapter produced. *(Replaces the separately-planned `ingestion_runs`; see §9.2.)*
+3. **`raw_payload_bodies`** + **`raw_payloads`** — the archive, split into content and observation. Bodies are content-addressed and globally deduplicated; observations are one row per fetch, partitioned monthly. The split is not stylistic: PostgreSQL cannot enforce a global unique constraint on a partitioned table, and a partitioned table cannot be the target of a single-column foreign key. See §9.1.
 4. **`feature_snapshots`** — `data_cutoff`, `feature_set_version`, `features`, `input_manifest_hash`, `completeness`, `missing_fields`.
 5. **`dataset_snapshots`** — the training-set identity: a `spec` (competitions, date range, filters) plus an `as_of` timestamp, a `row_count` and a `content_hash`. **It does not copy the data.** A training set is defined by a query and a point in time; the bitemporal tables make that definition reproducible, and the hash makes it verifiable.
 
@@ -56,7 +57,7 @@ Plus **`training_runs`** joining a model version to its dataset snapshot, hyperp
 ## 1.4 The two questions provenance must answer
 
 - *"Why did the model predict this?"* → `prediction → feature_snapshot → features jsonb`. Immediate, no reconstruction needed.
-- *"Was that input correct, and where did it come from?"* → re-run the as-of query at `data_cutoff`, land on fact revisions, each carrying `raw_payload_id` → the original bytes and the run that fetched them.
+- *"Was that input correct, and where did it come from?"* → re-run the as-of query at `data_cutoff`, land on fact revisions, each carrying `raw_payload_body_id` → the original bytes, and through `raw_payloads` the fetch and run that observed them.
 
 If the recomputed manifest hash does not match the stored one, something in the fact history was mutated outside the bitemporal discipline. **That mismatch is the single most important alarm in the system** — it means historical claims can no longer be trusted, and it should page someone.
 
@@ -253,7 +254,7 @@ Exchanges are not bookmakers: their prices are net of commission and their liqui
 `period` was missing from the v1 schema and is not optional — half-time markets are a different market with the same `market_type` label.
 
 **`odds_ticks`** — append-only, **one row only when the price or availability changes**:
-`series_id, observed_at, price numeric, is_available boolean, source_id, raw_payload_id`
+`series_id, observed_at, price numeric, is_available boolean, source_id, raw_payload_body_id`
 
 **`odds_coverage`** — `fixture_id, source_id, first_polled_at, last_polled_at, poll_count`.
 Without this, a gap in ticks is ambiguous between "price didn't move" and "we weren't looking". That distinction matters enormously when reconstructing a market.
@@ -541,18 +542,140 @@ What makes forward-only safe is the rule already stated in `ARCHITECTURE.md` §8
 
 ---
 
+# 9. Raw ingestion and provenance model (P0-04)
+
+Amends §1.3. Approved 2026-09-07 after a read-only design review. Claims marked **[VERIFIED]** were proved against PostgreSQL 17.6 in a disposable database; the repository was not modified by those experiments.
+
+## 9.1 Content and observation are separate tables
+
+| Table | Row means | Partitioned | Dedup |
+|---|---|---|---|
+| `raw_payload_bodies` | one distinct response body | **No** | **`UNIQUE (hash_algo, body_hash)`** — global |
+| `raw_payloads` | one observed fetch | **Yes** — monthly by `fetched_at` | **None** |
+
+The split is forced by PostgreSQL, not preference. **[VERIFIED]** a unique constraint on a partitioned table must include every partitioning column (`ERROR: unique constraint on partitioned table must include all partitioning columns`), so a partitioned `raw_payloads` cannot carry a global dedup key. **[VERIFIED]** a foreign key cannot reference a partitioned table by `id` alone (`ERROR: there is no unique constraint matching given keys`), so a partitioned archive could never be the single-column FK target that §1.3 requires of every fact row.
+
+Keeping bodies unpartitioned solves both, and preserves the property §1.3 depends on: **a future fact references one column, `raw_payload_bodies.id`, on an ordinary table.** Preserving that is the entire purpose of the split; the bitemporal fact model (§2) is otherwise unchanged.
+
+**[VERIFIED]** a partitioned `raw_payloads` can carry ordinary foreign keys to `data_sources`, `job_runs` and `raw_payload_bodies`. All three are declared once on the parent and automatically inherited by every partition, including `DEFAULT`, and all three are enforced on insert. `ON DELETE RESTRICT` on `body_id` blocks deletion of a referenced body, from a monthly partition and from `DEFAULT` alike, while an unreferenced body deletes normally:
+
+```
+ERROR:  update or delete on table "raw_payload_bodies" violates foreign key
+        constraint "raw_payloads_body_id_fkey" on table "raw_payloads"
+DETAIL:  Key (id)=(1) is still referenced from table "raw_payloads".
+```
+
+Retention can therefore never silently orphan cited evidence.
+
+## 9.2 `job_runs` absorbs `ingestion_runs`
+
+**One `job_runs` row = one invocation of one job against one source.** A provider *request* is not a run — it is a `raw_payloads` observation, carrying its own `fetched_at` and `http_status`. Two levels, no third.
+
+`ingestion_runs` is not built. It expressed the same concept under a different name, and Phase 0 has no scheduler to justify separating scheduling from ingestion. `source_id` and `adapter_version` are nullable columns on `job_runs`, set for ingest jobs and null for others. Split only if a single job genuinely fans out across several sources.
+
+- **Request retry** → another `raw_payloads` row. A 429 or 503 is evidence about the provider and is archived like any other response.
+- **Run retry** → a new row, `attempt` incremented, same `(job_name, scope_key, run_date)`.
+- **Partial failure** → `status = 'partial'`, counts in `stats`. **A failing run never rolls back payloads already written.** Evidence survives the failure of the process that collected it.
+
+## 9.3 Append-only evidence, with no mutable counters
+
+`seen_count` and `last_seen_at` are **removed from the schema**. They were mutable columns on immutable evidence, which contradicted append-only.
+
+Seen-counts are **derived from observations**, through a documented view:
+
+```
+v_raw_payload_seen(body_id, seen_count, first_seen_at, last_seen_at)
+  = aggregate over raw_payloads grouped by body_id
+```
+
+Consequently every column of `raw_payload_bodies` and `raw_payloads` is immutable once written. There is no `superseded_at` on either: **evidence is never corrected.** A provider issuing a correction sends new bytes, which are a new body and a new observation. Supersession belongs to derived facts, never to the archive — facts are beliefs and beliefs get revised; payloads are what the provider actually said.
+
+Enforced by grant, not convention: `engine_rw` receives `SELECT, INSERT` on both tables and **no `UPDATE` and no `DELETE` at all**. `job_runs` is the sole exception, receiving `UPDATE (status, finished_at, stats, error)` so a run can be closed.
+
+## 9.4 Body representation — exact semantics
+
+Ambiguity here silently corrupts deduplication, so each term is defined:
+
+| Term | Definition |
+|---|---|
+| **response content** | the response body **after transport decoding** — after `Content-Encoding: gzip` has been undone, before any parsing |
+| **`body_hash`** | **SHA-256 of the response-content bytes.** Lowercase hex, 64 characters |
+| **`hash_algo`** | names the algorithm (`sha256`) so it can be migrated without redefining the column |
+| **`body`** | when retained, **exactly the response-content bytes** — the same bytes that were hashed |
+| **`byte_size`** | the length in bytes of the response content, i.e. of what was hashed. Not the transfer size, not the stored size |
+
+Four rules follow, and each exists because the opposite is a plausible mistake:
+
+1. **JSON is never canonicalised before hashing.** Canonicalisation would make the hash depend on a canonicaliser whose output can change with a library upgrade, silently invalidating every historical hash. Determinism across time beats deduplication efficiency. A provider that reorders keys will defeat dedup; if that is ever observed, add a second hash column rather than redefining this one.
+2. **`Content-Encoding` is metadata about the transport, not about our storage.** It is not recorded as a property of `body`.
+3. **Never label `body` as gzip merely because the HTTP response was gzipped.** `body` holds decoded content. Any compression we apply for storage is our own choice, recorded separately if and when we apply it — it is not inherited from the response.
+4. **One size, unambiguously.** `byte_size` measures the hashed content. No second size column is added.
+
+## 9.5 The `DEFAULT` partition and its invariant
+
+`DEFAULT` exists as a **data-safety fallback**. **[VERIFIED]** without one, a row outside every bound is rejected outright (`ERROR: no partition of relation found for row`) and the payload is lost. With one, the payload survives and only the partitioning degrades.
+
+**`DEFAULT` must remain empty for any timestamp inside the pre-created range.** A row landing there means a month is missing — and it is not merely untidy: **[VERIFIED]** once a row for October sits in `DEFAULT`, attaching October's partition fails (`ERROR: updated partition constraint for default partition would be violated by some row`). Recovery requires detaching `DEFAULT`, relocating rows, and reattaching. **An unexpected row in `DEFAULT` is a failure, not a warning.**
+
+`db:verify-partitions` must assert:
+
+1. the parent is partitioned (`relkind = 'p'`) and its key is `fetched_at`;
+2. **`DEFAULT` exists**;
+3. **`DEFAULT` is empty**;
+4. the expected monthly bounds are present and **contiguous**, compared by bound (`pg_get_expr(relpartbound, oid)`) rather than by name — a partition dropped and replaced with wrong bounds must not pass;
+5. a **routing probe** for the current covered month reaches that month's partition — `BEGIN; INSERT; assert tableoid; ROLLBACK`, which works under append-only grants because nothing commits;
+6. any unexpected row in `DEFAULT` **fails the check**.
+
+This is a live PostgreSQL invariant check. It is not a variant of `db:verify-generate`, which never opens a connection (§8.3).
+
+## 9.6 Partition creation policy
+
+- **Pre-create 12 months** in the migration that creates the table.
+- **`DEFAULT` remains** permanently, as the safety net above.
+- **Phase 0 has no partition scheduler**, because Phase 0 has no scheduler at all (§G). Nothing creates month 13.
+- **Phase 1 owns automatic future-partition creation**, alongside the rest of the job scheduling.
+- Until then, **accumulation in `DEFAULT` must be observable**: `db:verify-partitions` is the alarm, and it must be run — not merely available.
+
+## 9.7 Migration and key conventions
+
+**Ownership** (§8.1): `data_sources`, `job_runs` and `raw_payload_bodies` are Drizzle-managed under `src/schema/**`. `raw_payloads`, its partitions, `DEFAULT`, the view and the grants are raw-SQL-owned, declared for typing under `src/raw-sql/**` and created by `--custom` migrations in the same ledger.
+
+**Primary keys — a convention, not a technical requirement:**
+
+- **UUID** for registry and reference entities (`data_sources`, and later `competitions`, `teams`, `seasons`) — stable, non-guessable, safe to mint outside the database.
+- **`bigint` identity** for append-only, log-style, high-volume records (`job_runs`, `raw_payload_bodies`, `raw_payloads`) — smaller, ordered, index-friendly.
+
+Either would work for either. The rule exists so the choice is not re-argued per table.
+
+**Index caveat [VERIFIED]:** `CREATE INDEX CONCURRENTLY` cannot be used on a partitioned table (`ERROR: cannot create index on partitioned table concurrently`), and cannot run inside a transaction, which the migrator always uses. Plain `CREATE INDEX` on the parent inside a transaction works and cascades to partitions. Harmless while tables are empty; adding an index to a populated partitioned table later will need an out-of-band procedure, not a migration.
+
+## 9.8 Retention — enabled, not implemented
+
+**No retention mechanism is built in P0-04.** No policy, no reaper, no configuration.
+
+Two schema decisions are made now because they are expensive to retrofit:
+
+1. **`body` is nullable.** Future tiering must be able to drop the payload bytes while preserving `body_hash`, `byte_size` and all provenance metadata. `NOT NULL` would foreclose that.
+2. **`ON DELETE RESTRICT`** on `raw_payloads.body_id`, so retention can never outrun referential integrity.
+
+## 9.9 P0-03 harness objects
+
+`harness_managed` and `harness_partitioned` **stay for now.** They are removed only after `db:verify-partitions` is green against the real P0-04 objects, and then through a forward migration (§8.5) — never by editing the existing ledger. Removing them before the real partitioning is verified would discard the only working proof of the pattern.
+
+---
+
 # A. Final architecture
 
 Unchanged from `ARCHITECTURE.md` in shape — three deployables, database as the engine↔app interface, one scoreline matrix deriving all markets. Four amendments:
 
-1. **Provenance is a first-class layer**, not metadata. Every fact carries `source_id`, `raw_payload_id`, `known_at`; lineage is proven by hash reconstruction rather than stored as a graph.
+1. **Provenance is a first-class layer**, not metadata. Every fact carries `source_id`, `raw_payload_body_id`, `known_at`; lineage is proven by hash reconstruction rather than stored as a graph.
 2. **Bitemporality is scoped to four fact tables**, with the as-of predicate encapsulated in a function and append-only enforced by column grants.
 3. **Odds are a separate normalised model** — `odds_series` + `odds_ticks` + `odds_coverage` — with strict naming discipline separating true closing prices from our own last observation.
 4. **Reproducibility is a Phase 0 deliverable**, built against a placeholder model, not a Phase 7 aspiration.
 
 # B. Final schema
 
-**Provenance** — `data_sources`, `ingestion_runs`, `raw_payloads` (partitioned monthly, deduped on `request_signature + body_hash`), `external_ids` (bitemporal), `job_runs`.
+**Provenance** (§9) — `data_sources`, `job_runs` (absorbs `ingestion_runs`), `raw_payload_bodies` (unpartitioned, globally deduped on `hash_algo + body_hash`), `raw_payloads` (partitioned monthly by `fetched_at`, one row per fetch, no global dedup constraint), `v_raw_payload_seen`, `external_ids` (bitemporal).
 
 **Canonical** — `countries`, `competitions`, `competition_names`, `seasons` (with `format`), `teams` (**no name column**), `team_names`, `team_aliases`, `venues`, `competition_coverage`.
 
@@ -581,7 +704,7 @@ Championship 2023/24 · consensus ground truth with manual adjudication of disag
 | **P0-01** | Monorepo skeleton: pnpm workspaces, Turbo, `apps/web` (empty), `apps/engine`, `packages/db`; CI running lint + typecheck | — |
 | **P0-02** | Local Postgres via Docker Compose; connection from both TS and Python | 01 |
 | **P0-03** | Drizzle harness: config with the `schema` glob scoped per §8.1, `generate` + `migrate` scripts, **one `--custom` SQL migration and one raw-SQL-owned table proven outside the glob**, plus the `db:verify-generate` CI check | 02 |
-| **P0-04** | Provenance core: `data_sources`, `ingestion_runs`, `raw_payloads` (monthly partitions — the partition proof), `job_runs`, plus `db:verify-partitions` | 03 |
+| **P0-04** | Provenance core per §9: `data_sources`, `job_runs`, `raw_payload_bodies` (Drizzle), `raw_payloads` partitioned monthly + `DEFAULT` + `v_raw_payload_seen` (raw-SQL), grants, plus `db:verify-partitions` | 03 |
 | **P0-05** | Canonical entities: countries, competitions, `competition_names`, seasons, teams (no name column), `team_names`, aliases, venues | 03 |
 | **P0-06** | `external_ids` (bitemporal) + `entity_review_queue` | 04, 05 |
 | **P0-07** | Fixture identity: `fixtures` + `fixture_schedule` (bitemporal), ties, legs, replays | 05 |
@@ -606,16 +729,16 @@ Phase 0 ends at P0-18, not P0-17. **The waiting period is part of the plan** —
 | P0-01 | CI green on an empty repo; `pnpm -r typecheck` and `uv run pytest` both exit 0 |
 | P0-02 | Both a TS and a Python process connect and round-trip a query; `docker compose down -v && up` reproduces a clean DB |
 | P0-03 | Three proofs, none of which may use `tablesFilter` (§8.2): **(1)** a real Drizzle-managed table produces a migration, and repeated `drizzle-kit generate` runs on the unchanged schema produce an empty diff; **(2)** a `--custom` SQL migration applies successfully and is recorded in the same migration ledger; **(3)** a raw-SQL-owned table declared outside the Drizzle `schema` glob is fully typed and queryable but is **not emitted** by `generate`, and repeated generation stays clean. Plus `db:verify-generate` running in CI as a schema-input consistency check — **not** described or relied on as database drift detection (§8.3) |
-| P0-04 | A payload inserted twice yields **one row** with `seen_count = 2`; partitions exist for the current and next month; a partition drop leaves other data intact; **`db:verify-partitions` asserts the database invariants** — `raw_payloads` is still `relkind = 'p'`, the expected partitions are attached, and no rows sit in the parent — and fails loudly when any of them is violated |
+| P0-04 | Fetching the same body twice yields **one `raw_payload_bodies` row and two `raw_payloads` rows**, with `v_raw_payload_seen.seen_count = 2` (§9.3); 12 monthly partitions plus `DEFAULT` exist; a partition drop leaves other data intact; `engine_rw` is **refused** `UPDATE` and `DELETE` on both archive tables; deleting a referenced body is refused by `ON DELETE RESTRICT`; and **`db:verify-partitions` asserts all six invariants in §9.5** — including that `DEFAULT` is empty and that a routing probe reaches the current month's partition — failing loudly on any violation |
 | P0-05 | A team can be renamed and both the historical and the current name resolve correctly at their respective dates; `teams` has no name column |
 | P0-06 | An external ID remapped to a different internal entity leaves the old mapping intact with `superseded_at` set; the as-of query returns the old mapping for a past cutoff |
 | P0-07 | Both legs of a two-legged tie insert without violating the unique constraint; a replay inserts as a new fixture linked by `replaces_fixture_id`; a reschedule creates a schedule revision, **not** a duplicate fixture |
 | P0-08 | **The §2.3 worked example passes as an automated test** — insert 2–1, insert the 2–2 correction, and assert the as-of query at T2 returns 2–1 while the current query returns 2–2. An `UPDATE` on a score column is **rejected by the database** for `engine_rw` |
 | P0-09 | Polling an unchanged price twice writes **one** tick; a suspension writes a tick with `is_available = false`; `odds_coverage` distinguishes "not polled" from "unchanged" |
 | P0-10 | The contract test suite runs against a stub adapter and fails it for each of: provider shape leakage, missing `known_at`, absent raw payload persistence |
-| P0-11 | The adapter passes the contract suite; every ingested row traces to a `raw_payload_id`; re-running the import is idempotent (row counts unchanged) |
+| P0-11 | The adapter passes the contract suite; every ingested row traces to a `raw_payload_body_id`; re-running the import is idempotent (row counts unchanged) |
 | P0-12 | ≥95% of teams auto-resolve; every unresolved team appears in the review queue; **zero teams are silently auto-created** |
-| P0-13 | Row counts match the source CSVs; every fact row has non-null `source_id`, `raw_payload_id`, `known_at`; spot-check of 20 fixtures against the source is exact |
+| P0-13 | Row counts match the source CSVs; every fact row has non-null `source_id`, `raw_payload_body_id`, `known_at`; spot-check of 20 fixtures against the source is exact |
 | P0-14 | Every assertion from `ARCHITECTURE.md` §7 runs and passes; a deliberately corrupted row is caught and quarantined rather than published |
 | P0-15 | **L1 passes bit-for-bit** on the placeholder model; **L2 passes**; mutating a historical fact makes L2 fail with a clear message |
 | P0-16 | `app_rw` cannot write engine tables and `engine_rw` cannot write app tables — both proven by tests that expect a permission error |

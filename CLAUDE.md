@@ -24,7 +24,7 @@ These are expensive or impossible to retrofit. Do not relax one without an expli
 3. **Fact tables are append-only.** Corrections insert a new revision and set `superseded_at`. Enforced by column-level GRANT, not convention.
 4. **Fixture identity never contains kickoff time** — `(season_id, stage, leg, replay_number, home_team_id, away_team_id)`. Rescheduling must not create a duplicate.
 5. **`teams` has no name column.** Names live in `team_names` with validity ranges.
-6. **Every fact row carries `source_id`, `raw_payload_id`, `known_at`.** No exceptions.
+6. **Every fact row carries `source_id`, `raw_payload_body_id`, `known_at`.** No exceptions. The body reference is a single-column FK to the unpartitioned `raw_payload_bodies`; keeping it single-column is why the raw archive is split (`PHASE-0-SPEC.md` §9.1).
 7. **A price is only "closing" if the source defines it as closing.** Our own last observation is `last_observed_pre_kickoff` and is not the same thing.
 8. **Odds ticks are written only on change**, never per poll.
 9. **The database is the engine↔app interface.** The web app never invokes the model in a request path.
@@ -60,4 +60,7 @@ pnpm py:test:db             # database-backed tests (uv run pytest -m db)
 - **`generate` never reads the database.** It compares the schema input against Drizzle's snapshot. It cannot detect database-side drift; that needs explicit invariant checks (§8.3).
 - Migrations are forward-only. Correct mistakes with a new migration; reset locally with `pnpm db:reset`; production recovers by restore, not reversal (§8.5).
 - Always pass `--name` when generating a migration. Auto-generated random names are not acceptable.
+- **Raw payloads are evidence, not belief.** `raw_payload_bodies` and `raw_payloads` are strictly immutable: no `UPDATE`, no `DELETE`, no `superseded_at`. A provider correction is new bytes, not an edit. Only derived facts get revised (§9.3).
+- **Primary keys** (convention, not a technical requirement): UUID for registry/reference entities, `bigint` identity for append-only log-style high-volume tables (§9.7).
+- **A row in a `DEFAULT` partition is a failure, not a warning.** Once a row for a given month sits in `DEFAULT`, that month's partition can no longer be attached without detaching and relocating. `db:verify-partitions` asserts `DEFAULT` is empty (§9.5).
 - Every feature and training query needs an explicit `ORDER BY` — unordered rows change floating-point summation order and break reproducibility.
