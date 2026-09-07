@@ -15,6 +15,27 @@
       "when": 1788818281607,
       "tag": "0001_harness_partitioned_raw_sql",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1788824559747,
+      "tag": "0002_p0_04_registry",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1788824560994,
+      "tag": "0003_p0_04_raw_payload_bodies",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1788824575543,
+      "tag": "0004_p0_04_raw_payloads_partitioned",
+      "breakpoints": true
     }
   ]
 }

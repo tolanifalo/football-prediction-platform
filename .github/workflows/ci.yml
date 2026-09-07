@@ -43,6 +43,7 @@ jobs:
       - run: pnpm db:migrate
       - run: pnpm db:verify-generate
       - run: pnpm db:verify-harness
+      - run: pnpm db:verify-partitions
 
   python:
     runs-on: ubuntu-latest

@@ -19,6 +19,7 @@
     "db:migrate": "pnpm --filter @fpp/db db:migrate",
     "db:verify-generate": "pnpm --filter @fpp/db db:verify-generate",
     "db:verify-harness": "pnpm --filter @fpp/db db:verify-harness",
+    "db:verify-partitions": "pnpm --filter @fpp/db db:verify-partitions",
     "verify": "pnpm -r typecheck && pnpm -r lint && pnpm py:lint && pnpm py:typecheck && pnpm py:test"
   },
   "devDependencies": {
