@@ -8,10 +8,12 @@ Stack: Next.js + TypeScript + Supabase/Postgres (app) · Python (modelling) · p
 | Doc | Authority |
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System shape, layers, API boundaries, jobs, deployment, phases. **§3 (schema) is superseded — see below.** |
-| [docs/DECISIONS-01.md](docs/DECISIONS-01.md) | ORM decision, provider evaluation framework, data-ownership analysis, v1 stress test. **§D (Phase 0 order) is superseded.** |
-| [docs/PHASE-0-SPEC.md](docs/PHASE-0-SPEC.md) | **Authoritative for schema, provenance, bitemporality, odds model, reproducibility, and the Phase 0 plan.** |
+| [docs/DECISIONS-01.md](docs/DECISIONS-01.md) | ORM decision, provider evaluation framework, data-ownership analysis, v1 stress test. **§D (Phase 0 order) and the migration-mechanics rows in §1 are superseded.** |
+| [docs/PHASE-0-SPEC.md](docs/PHASE-0-SPEC.md) | **Authoritative for schema, provenance, bitemporality, odds model, reproducibility, migration harness, and the Phase 0 plan.** |
 
-Where the documents disagree, **PHASE-0-SPEC wins**. It supersedes `ARCHITECTURE.md` §3 and `DECISIONS-01.md` §D. Known divergences are listed in `docs/PHASE-0-SPEC.md`; do not "fix" ARCHITECTURE.md to match without being asked.
+Where the documents disagree, **PHASE-0-SPEC wins**. It supersedes `ARCHITECTURE.md` §3, `DECISIONS-01.md` §D, and the `tablesFilter` / drift-detection rows in `DECISIONS-01.md` §1. The superseded documents are kept as historical decision records with their original reasoning intact; obsolete statements carry an inline **`[SUPERSEDED <date>]`** marker pointing at the replacement rule. Do not delete or rewrite the historical text, and do not "fix" these documents to match without being asked.
+
+**Specifically obsolete — do not follow, in `DECISIONS-01.md` §1:** the row prescribing that raw-SQL-owned tables be declared in the generated schema and excluded with `tablesFilter`, and the row claiming the empty-diff CI job detects database-side drift. Both were disproved experimentally; `PHASE-0-SPEC.md` §8 has the corrected rules. `grep -n "SUPERSEDED" docs/` lists every marked statement.
 
 ## Non-negotiables
 
@@ -37,10 +39,13 @@ Phase 0 delivers a trustworthy database with proven provenance and **nothing vis
 ## Commands
 
 ```bash
-pnpm install && uv sync          # setup
-pnpm -r typecheck && pnpm -r lint
-uv run pytest -q
-uv run ruff check . && uv run mypy src
+pnpm install && uv sync     # setup
+pnpm verify                 # typecheck + lint + both test suites; does NOT need Docker
+
+pnpm db:up                  # start local postgres (port 5433)
+pnpm db:reset               # down -v && up: rebuild a clean database
+pnpm db:check               # TypeScript round-trip
+pnpm py:test:db             # database-backed tests (uv run pytest -m db)
 ```
 
 `docs/PHASE-0-SPEC.md` §F lists the full verification set as tasks land.
@@ -48,6 +53,11 @@ uv run ruff check . && uv run mypy src
 ## Conventions
 
 - All timestamps `timestamptz`, stored UTC. Reject any ingested datetime lacking an explicit UTC offset.
-- Migrations: `drizzle-kit generate` + `migrate` only. **Never `drizzle-kit push`** — it silently skips RLS policies.
-- Partitioned tables and materialised views are owned by `--custom` SQL migrations and excluded via `tablesFilter`.
+- PostgreSQL **17.6**, pinned to the exact patch. Local database on port **5433**; `pnpm verify` does not require Docker. See `PHASE-0-SPEC.md` §7.
+- Migrations: `drizzle-kit generate` + `migrate` only. **Never `drizzle-kit push`** — it skips RLS policies and drops tables it does not know about.
+- **Schema ownership is a directory split** (`PHASE-0-SPEC.md` §8.1): `packages/db/src/schema/**` is the Drizzle `schema` glob; `packages/db/src/raw-sql/**` holds typed declarations for partitioned tables and materialised views whose DDL lives in `--custom` SQL migrations. Keeping raw-SQL objects out of the glob is what keeps them out of `generate`.
+- **`tablesFilter` does not exclude anything from `generate`** — it filters database introspection (`pull`/`push`) only. Never reach for it to keep a table out of a generated migration.
+- **`generate` never reads the database.** It compares the schema input against Drizzle's snapshot. It cannot detect database-side drift; that needs explicit invariant checks (§8.3).
+- Migrations are forward-only. Correct mistakes with a new migration; reset locally with `pnpm db:reset`; production recovers by restore, not reversal (§8.5).
+- Always pass `--name` when generating a migration. Auto-generated random names are not acceptable.
 - Every feature and training query needs an explicit `ORDER BY` — unordered rows change floating-point summation order and break reproducibility.

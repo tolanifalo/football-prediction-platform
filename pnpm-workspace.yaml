@@ -1,3 +1,9 @@
 packages:
   - "apps/*"
   - "packages/*"
+
+# drizzle-kit pulls in esbuild. Its install script is not needed: generate,
+# generate --custom and migrate all verified working without it. Flip to true
+# if a future drizzle-kit command needs esbuild's native binary.
+allowBuilds:
+  esbuild: false

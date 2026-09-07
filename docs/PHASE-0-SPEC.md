@@ -447,6 +447,100 @@ pnpm db:reset       # down -v && up: rebuilds a clean database
 
 ---
 
+# 8. Migration harness and schema ownership
+
+Everything in this section marked **[PROVEN]** was established empirically against **drizzle-kit 0.31.10 / drizzle-orm 0.45.2 / PostgreSQL 17.6** on 2026-09-06, in an isolated experiment. Where this section contradicts `DECISIONS-01.md` §1, **this section is correct and `DECISIONS-01.md` is retained unchanged as a historical decision record.**
+
+## 8.1 Schema ownership — two directories
+
+Objects are split by *who owns their DDL*, and the split is physical:
+
+| Path | Owns | Seen by `generate`? |
+|---|---|---|
+| `packages/db/src/schema/**` | Tables whose DDL Drizzle can express and generate | **Yes** — this is the config's `schema` glob |
+| `packages/db/src/raw-sql/**` | Typed `pgTable` declarations for objects whose physical DDL is maintained by `--custom` SQL migrations | **No** |
+
+**The `drizzle.config.ts` `schema` glob points at `packages/db/src/schema/**` and nothing else.** That single fact is what keeps raw-SQL-owned objects out of the generated diff.
+
+Declarations under `raw-sql/` are ordinary `pgTable` definitions. They remain **fully typed and queryable** through Drizzle — select, insert, joins, inferred row types — because typing is a property of the declaration, not of the config glob. They are simply invisible to `generate`. **[PROVEN]** — a partitioned table declared this way accepted an insert through Drizzle, routed correctly to its partition, and left `generate` reporting *"No schema changes"*.
+
+Objects that belong in `raw-sql/`: partitioned tables (`raw_payloads`, `odds_ticks`), materialised views (`standings`), and anything else whose DDL Drizzle cannot express.
+
+**Withdrawn:** the earlier prescription — declare raw-SQL-owned tables in the generated schema and exclude them with `tablesFilter` — **does not work and must not be used.** **[PROVEN]** declaring a partitioned table in the `schema` glob makes `generate` emit a plain, *unpartitioned* `CREATE TABLE` for it, and adding `tablesFilter` produces byte-identical output.
+
+## 8.2 `tablesFilter` — what it actually does
+
+**`tablesFilter` does not filter the schema-input side of `drizzle-kit generate`. It applies to database introspection operations — `pull` and `push`.** **[PROVEN]** across three pattern forms (`["!excluded"]`, `["allowed"]`, `["glob*"]`); every one still emitted the excluded table.
+
+Its real role, confirmed by control: with `tablesFilter` set, `push` left a database-only table alone; **without** it, `push` dropped that table. It protects *database-side* tables from tooling that reads the database.
+
+Therefore:
+
+- **It is not a mechanism for excluding tables from `generate`.** Use the directory split in §8.1.
+- **Retain it only for pull-based database inspection** (§8.3), where it is genuinely needed to stop raw-SQL-owned objects registering as drift.
+- `push` remains banned regardless (it skips RLS policies, and as shown above it drops unmanaged tables).
+
+## 8.3 Drift — two different concerns, one of which we do not yet detect
+
+These are not the same thing and must never be described as if they were.
+
+**Schema-input consistency** — what `generate` checks:
+
+> `drizzle-kit generate` detects drift between the Drizzle schema input and Drizzle's migration snapshot/journal state. **It does not inspect PostgreSQL and therefore cannot detect arbitrary database-side drift.**
+
+**[PROVEN]** `generate` compares `schema.ts` against the latest `meta/*_snapshot.json` only. It ran successfully with the database container **stopped**; it reported no changes after the managed table was dropped from the database; and it re-emitted a `CREATE TABLE` when the table was stripped from the snapshot while the journal was left intact.
+
+What the empty-diff check does and does not catch **[PROVEN]**:
+
+| Change | Detected |
+|---|---|
+| Schema input changed without generating a migration | **Yes** |
+| Migration journal edited | No — and `migrate` also reported success |
+| Database column added by raw SQL | No |
+| Raw-SQL-owned object altered, partition dropped | No |
+
+**Database-side drift is a separate, currently-unaddressed concern.** Detecting it requires all three of:
+
+1. `drizzle-kit pull` / introspection into a scratch location, diffed against expectation — this is where `tablesFilter` earns its place;
+2. **explicit invariant checks for raw-SQL-owned objects** — nothing in the Drizzle toolchain knows a partitioned table should still be partitioned (`db:verify-partitions`, P0-04);
+3. CI running both.
+
+Only (2) is scheduled in Phase 0. (1) and (3) are deferred and must be recorded as a known gap, not assumed.
+
+## 8.4 Migration conventions
+
+| Concern | Convention |
+|---|---|
+| **Migration directory** | `packages/db/drizzle/` — the drizzle-kit default `out`, containing `NNNN_*.sql` and `meta/`. No override; the default is the simplest thing that works |
+| **SQL migration naming** | Always pass `--name` with a descriptive slug: `pnpm db:generate --name=add_raw_payloads_partitions` → `0003_add_raw_payloads_partitions.sql`. Drizzle's auto-generated random names (`0000_faulty_vector`) are unreviewable and are not acceptable in this repo |
+| **TS ↔ SQL casing** | Database is `snake_case`; TypeScript identifiers are `camelCase`; **the SQL name is given explicitly in every column definition** — `bodyHash: text("body_hash")`. **[PROVEN]** to work. A global `casing: "snake_case"` config option exists and may replace this if P0-03 verifies it, but explicit names are the default because they are greppable and immune to config changes |
+| **Custom migrations** | `pnpm db:generate --custom --name=<slug>`, which scaffolds a file containing only a comment header. Separate statements with `--> statement-breakpoint` |
+| **Custom SQL location** | **Inline, in the migration file itself.** Not maintained as a separate source file and copied in — that creates two copies and a synchronisation problem. Migrations are immutable once applied, so the migration file is the only correct home |
+| **Review** | Every generated and custom migration is read by a human before merge. Migrations are reviewed artefacts, not build output |
+
+## 8.5 Rollback policy
+
+**Drizzle does not generate down migrations, and we are not building a rollback framework.** That is a deliberate decision, not an omission. Three distinct situations, three distinct answers:
+
+**1. Forward corrective migration — the only production mechanism.**
+A mistake is corrected by writing a new migration that moves forward. There is no reverse migration for a deployed schema change.
+
+**2. Local development database reset — total and cheap.**
+`pnpm db:reset` (`docker compose down -v && up`, then migrate). Local databases hold no data worth preserving in Phase 0, so reset is always available and always preferred over hand-repairing a local schema.
+
+**3. Production rollback — restore, not reverse.**
+Point-in-time restore from managed backups, never migration reversal. Reversing a migration that has already accepted writes loses data; restoring is honest about what is happening.
+
+What makes forward-only safe is the rule already stated in `ARCHITECTURE.md` §8: **migrations are expand-then-contract and must remain compatible with the previously deployed application version.** An application rollback then never requires a schema rollback. Destructive changes (`DROP COLUMN`, `DROP TABLE`) ship as their own separately reviewed migration, never bundled with an additive one.
+
+**Known limitation, recorded deliberately [PROVEN]:** Drizzle does not verify the integrity of already-applied migrations. Editing a migration file after it has been applied is silently ignored by `migrate` — no error, no re-application. Migration immutability is enforced by code review, not by tooling.
+
+## 8.6 PostgreSQL version
+
+**PostgreSQL 17.6, pinned to the exact patch** — see §7.1 for the full rule and the Supabase-compatibility requirement. The migration harness is developed and verified against this version.
+
+---
+
 # A. Final architecture
 
 Unchanged from `ARCHITECTURE.md` in shape — three deployables, database as the engine↔app interface, one scoreline matrix deriving all markets. Four amendments:
@@ -486,8 +580,8 @@ Championship 2023/24 · consensus ground truth with manual adjudication of disag
 |---|---|---|
 | **P0-01** | Monorepo skeleton: pnpm workspaces, Turbo, `apps/web` (empty), `apps/engine`, `packages/db`; CI running lint + typecheck | — |
 | **P0-02** | Local Postgres via Docker Compose; connection from both TS and Python | 01 |
-| **P0-03** | Drizzle harness: config, `generate` + `migrate` scripts, **one `--custom` SQL migration and one `tablesFilter` exclusion proven end to end** | 02 |
-| **P0-04** | Provenance core: `data_sources`, `ingestion_runs`, `raw_payloads` (monthly partitions — the partition proof), `job_runs` | 03 |
+| **P0-03** | Drizzle harness: config with the `schema` glob scoped per §8.1, `generate` + `migrate` scripts, **one `--custom` SQL migration and one raw-SQL-owned table proven outside the glob**, plus the `db:verify-generate` CI check | 02 |
+| **P0-04** | Provenance core: `data_sources`, `ingestion_runs`, `raw_payloads` (monthly partitions — the partition proof), `job_runs`, plus `db:verify-partitions` | 03 |
 | **P0-05** | Canonical entities: countries, competitions, `competition_names`, seasons, teams (no name column), `team_names`, aliases, venues | 03 |
 | **P0-06** | `external_ids` (bitemporal) + `entity_review_queue` | 04, 05 |
 | **P0-07** | Fixture identity: `fixtures` + `fixture_schedule` (bitemporal), ties, legs, replays | 05 |
@@ -511,8 +605,8 @@ Phase 0 ends at P0-18, not P0-17. **The waiting period is part of the plan** —
 |---|---|
 | P0-01 | CI green on an empty repo; `pnpm -r typecheck` and `uv run pytest` both exit 0 |
 | P0-02 | Both a TS and a Python process connect and round-trip a query; `docker compose down -v && up` reproduces a clean DB |
-| P0-03 | `drizzle-kit generate` on unchanged schema produces an **empty diff**; a custom SQL migration applies; a `tablesFilter`-excluded table is untouched by generate |
-| P0-04 | A payload inserted twice yields **one row** with `seen_count = 2`; partitions exist for the current and next month; a partition drop leaves other data intact |
+| P0-03 | Three proofs, none of which may use `tablesFilter` (§8.2): **(1)** a real Drizzle-managed table produces a migration, and repeated `drizzle-kit generate` runs on the unchanged schema produce an empty diff; **(2)** a `--custom` SQL migration applies successfully and is recorded in the same migration ledger; **(3)** a raw-SQL-owned table declared outside the Drizzle `schema` glob is fully typed and queryable but is **not emitted** by `generate`, and repeated generation stays clean. Plus `db:verify-generate` running in CI as a schema-input consistency check — **not** described or relied on as database drift detection (§8.3) |
+| P0-04 | A payload inserted twice yields **one row** with `seen_count = 2`; partitions exist for the current and next month; a partition drop leaves other data intact; **`db:verify-partitions` asserts the database invariants** — `raw_payloads` is still `relkind = 'p'`, the expected partitions are attached, and no rows sit in the parent — and fails loudly when any of them is violated |
 | P0-05 | A team can be renamed and both the historical and the current name resolve correctly at their respective dates; `teams` has no name column |
 | P0-06 | An external ID remapped to a different internal entity leaves the old mapping intact with `superseded_at` set; the as-of query returns the old mapping for a past cutoff |
 | P0-07 | Both legs of a two-legged tie insert without violating the unique constraint; a replay inserts as a new fixture linked by `replaces_fixture_id`; a reschedule creates a schedule revision, **not** a duplicate fixture |
@@ -535,10 +629,10 @@ Phase 0 ends at P0-18, not P0-17. **The waiting period is part of the plan** —
 docker compose up -d && docker compose ps
 pnpm install && uv sync
 
-# Schema integrity — the empty-diff check is the drift alarm
+# Schema-input consistency — NOT database drift detection (see section 8.3)
 pnpm db:migrate
-pnpm db:generate          # must produce an empty diff
-pnpm db:verify-partitions
+pnpm db:verify-generate     # generate must emit no new migration
+pnpm db:verify-partitions   # database invariant check for raw-SQL-owned objects
 
 # Static checks
 pnpm -r typecheck && pnpm -r lint

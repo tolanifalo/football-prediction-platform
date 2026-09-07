@@ -6,10 +6,18 @@
   "main": "src/index.ts",
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
-    "lint": "eslint src",
-    "db:check": "node src/connection.ts"
+    "lint": "eslint src drizzle.config.ts",
+    "db:check": "node src/connection.ts",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "node src/migrate.ts",
+    "db:verify-generate": "node src/verify-generate.ts",
+    "db:verify-harness": "node src/verify-harness.ts"
   },
   "dependencies": {
+    "drizzle-orm": "0.45.2",
     "postgres": "^3.4"
+  },
+  "devDependencies": {
+    "drizzle-kit": "0.31.10"
   }
 }

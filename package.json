@@ -15,6 +15,10 @@
     "db:down": "docker compose down",
     "db:reset": "docker compose down -v && docker compose up -d --wait",
     "db:check": "pnpm --filter @fpp/db db:check",
+    "db:generate": "pnpm --filter @fpp/db db:generate",
+    "db:migrate": "pnpm --filter @fpp/db db:migrate",
+    "db:verify-generate": "pnpm --filter @fpp/db db:verify-generate",
+    "db:verify-harness": "pnpm --filter @fpp/db db:verify-harness",
     "verify": "pnpm -r typecheck && pnpm -r lint && pnpm py:lint && pnpm py:typecheck && pnpm py:test"
   },
   "devDependencies": {

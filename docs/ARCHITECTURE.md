@@ -117,6 +117,8 @@ football-prediction-platform/
 
 **Schema ownership (a real trap).** Two migration tools fighting over one database is a guaranteed outage. **Drizzle in `packages/db` owns the schema and every migration.** Python reads and writes through SQLAlchemy Core against the existing schema and never migrates. CI regenerates the Python table definitions from the Drizzle schema, so drift fails the build.
 
+> **DEFERRED / NOT YET IMPLEMENTED** — the final sentence above (CI regenerating Python table definitions from the Drizzle schema, with drift failing the build) describes an intended capability that does not exist. No Phase 0 task builds it, and it is **outside current Phase 0 scope**. Until it is built, TypeScript↔Python schema agreement is unverified and must not be assumed. The preceding sentences — Drizzle as sole schema owner, Python never migrating — are in force today.
+
 **Deliberate deferrals:** `packages/ui` — don't create it until a second frontend exists; components live in `apps/web/components` until then. `packages/contracts` — inline the zod schemas in `apps/web` until Python actually needs to consume them (Phase 2).
 
 ---

@@ -40,6 +40,9 @@ jobs:
       - run: pnpm -r typecheck
       - run: pnpm -r lint
       - run: pnpm db:check
+      - run: pnpm db:migrate
+      - run: pnpm db:verify-generate
+      - run: pnpm db:verify-harness
 
   python:
     runs-on: ubuntu-latest

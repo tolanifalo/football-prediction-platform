@@ -35,8 +35,8 @@ So the decision rests on schema fit, not performance.
 |---|---|
 | Weaker migration ergonomics than `prisma migrate dev` | Use `drizzle-kit generate` + `migrate` exclusively; review every generated SQL file by hand before merge. Treat migrations as reviewed artefacts, not output. |
 | `drizzle-kit push` does not apply RLS policies correctly `[REPORTED]` | **Never use `push` outside a local throwaway database.** CI runs `generate` + `migrate` only. |
-| Cannot express `PARTITION BY`, matviews | Declare those tables in `schema.ts` for typing, exclude them from drizzle-kit's managed set via `tablesFilter`, and own their DDL in `--custom` SQL migrations in the same ledger. |
-| No drift detection | A CI job diffs `drizzle-kit generate` output against an empty diff; non-empty = someone changed the DB out of band. |
+| Cannot express `PARTITION BY`, matviews | Declare those tables in `schema.ts` for typing, exclude them from drizzle-kit's managed set via `tablesFilter`, and own their DDL in `--custom` SQL migrations in the same ledger. — **[SUPERSEDED 2026-09-06]** `tablesFilter` has no effect on `drizzle-kit generate`; a table declared in the schema glob is emitted regardless, as a plain *unpartitioned* `CREATE TABLE`. Authoritative rule: **`PHASE-0-SPEC.md` §8.1–§8.2** (exclusion is by directory, not by filter). Original text retained as a record of what was believed at the time. |
+| No drift detection | A CI job diffs `drizzle-kit generate` output against an empty diff; non-empty = someone changed the DB out of band. — **[SUPERSEDED 2026-09-06]** `generate` never reads the database. It detects drift between the schema input and Drizzle's snapshot only, so a database changed out of band passes this check silently. Authoritative rule: **`PHASE-0-SPEC.md` §8.3**. |
 
 **Rejected alternative worth one line:** Supabase CLI owning plain-SQL migrations with Drizzle as a query-builder only. Simpler in isolation, but it creates two sources of schema truth (SQL files + `schema.ts`) that drift silently. One ledger wins.
 
@@ -271,7 +271,7 @@ Four hidden problems. (a) Books offer **different lines** — averaging a 2.5 an
 
 # A. Decisions to lock now
 
-1. **Drizzle** as ORM; `generate` + `migrate` only, never `push`; partitioned tables and matviews owned by `--custom` SQL migrations inside the same ledger and excluded via `tablesFilter`.
+1. **Drizzle** as ORM; `generate` + `migrate` only, never `push`; partitioned tables and matviews owned by `--custom` SQL migrations inside the same ledger and excluded via `tablesFilter`. — **[SUPERSEDED 2026-09-06, in part]** The ORM choice, the `generate`/`migrate`-only rule, the `push` ban and the single-ledger requirement all stand. Only the exclusion mechanism is wrong: `tablesFilter` does not exclude anything from `generate`. Raw-SQL-owned objects are excluded by directory — see **`PHASE-0-SPEC.md` §8.1**.
 2. **The database is the engine↔app interface** (D2). Unchanged.
 3. **One scoreline matrix derives every market** (D3). Unchanged.
 4. **Provider-neutral core**: internal UUIDs, `external_ids` with validity ranges, `raw_payloads` archive, adapter interface. No provider ID is ever a primary key.
@@ -323,7 +323,7 @@ Strictly ordered; each step is verifiable before the next begins.
 2. **Local Postgres via Docker** with a seed script. Never point development at a provider.
 3. **Schema v1 in Drizzle** — reference and canonical entities only (countries, competitions, seasons, teams, team_names, aliases, venues, fixtures), with the corrected identity keys from A7 and A8 baked in from the first migration.
 4. **The bitemporal fact tables** — `match_results`, `match_stats` as revision tables with their "latest" views. Do this before any data exists, because retrofitting is brutal.
-5. **Provider abstraction tables** — `data_sources`, `external_ids` with validity, `raw_payloads` (partitioned, via a custom SQL migration), `ingestion_runs`, `job_runs`. Prove the partition + `tablesFilter` pattern works end to end here, on the least important table, before it matters.
+5. **Provider abstraction tables** — `data_sources`, `external_ids` with validity, `raw_payloads` (partitioned, via a custom SQL migration), `ingestion_runs`, `job_runs`. Prove the partition + `tablesFilter` pattern works end to end here, on the least important table, before it matters. — **[SUPERSEDED 2026-09-06]** There is no "`tablesFilter` pattern": see **`PHASE-0-SPEC.md` §8.1–§8.2**. The instinct to prove the pattern early was right and survives as P0-03; the mechanism named here was wrong. Note that §D of this document is superseded in its entirety by **`PHASE-0-SPEC.md` §D**.
 6. **`ProviderAdapter` interface + a throwaway adapter** against a free source (football-data.org, or football-data.co.uk CSVs). Goal is to exercise the seam, not to pick a vendor.
 7. **Load the football-data.co.uk historical spine** — results plus opening and closing odds for two or three leagues. This becomes the backtest baseline and validates the odds schema against real, messy data.
 8. **Entity resolution + the data-quality assertion suite** — aliases, the review queue, and the checks from `ARCHITECTURE.md` §7 running as part of ingest.

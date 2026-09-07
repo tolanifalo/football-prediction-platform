@@ -1,0 +1,20 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1788818261878,
+      "tag": "0000_harness_managed",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1788818281607,
+      "tag": "0001_harness_partitioned_raw_sql",
+      "breakpoints": true
+    }
+  ]
+}
