@@ -27,7 +27,9 @@ try {
   // Raw-SQL-owned object: typed insert/select through the declaration that
   // generate cannot see.
   const observedAt = new Date("2026-09-07T12:00:00Z");
-  await db.insert(harnessPartitioned).values({ id: 1n, label: "p0-03-raw", observedAt });
+  // No explicit id: bigserial assigns it, so the script is re-runnable against
+  // a database that already holds harness rows.
+  await db.insert(harnessPartitioned).values({ label: "p0-03-raw", observedAt });
   const rows = await db
     .select()
     .from(harnessPartitioned)
