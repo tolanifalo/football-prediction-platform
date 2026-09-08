@@ -20,7 +20,7 @@ Where the documents disagree, **PHASE-0-SPEC wins**. It supersedes `ARCHITECTURE
 These are expensive or impossible to retrofit. Do not relax one without an explicit decision recorded in `docs/`.
 
 1. **The prediction engine never reads bookmaker odds.** `value/` may import `models/`; `models/` may not import `value/`. Otherwise value detection is circular.
-2. **Features only read facts with `known_at <= data_cutoff`**, via the `as_of` SQL function. Never hand-write that predicate — every future leakage bug will be a hand-written variant of it.
+2. **Features only read facts with `known_at <= data_cutoff`**, via the shared as-of mechanism. Never hand-write that predicate — every future leakage bug will be a hand-written variant of it. The mechanism is **built in P0-06** (§11.1) and consumed by P0-08 onward; it must exist in exactly one place, including in verification scripts.
 3. **Fact tables are append-only.** Corrections insert a new revision and set `superseded_at`. Enforced by column-level GRANT, not convention.
 4. **Fixture identity never contains kickoff time** — `(season_id, stage, leg, replay_number, home_team_id, away_team_id)`. Rescheduling must not create a duplicate.
 5. **`teams` has no name column.** Names live in `team_names` with validity ranges, half-open `[valid_from, valid_to)`. Names are **closed, never edited** — `GRANT UPDATE (valid_to)` only (§10.6).

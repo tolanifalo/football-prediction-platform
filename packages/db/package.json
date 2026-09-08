@@ -13,7 +13,8 @@
     "db:verify-generate": "node src/verify-generate.ts",
     "db:verify-harness": "node src/verify-harness.ts",
     "db:verify-partitions": "node src/verify-partitions.ts",
-    "db:verify-canonical": "node src/verify-canonical.ts"
+    "db:verify-canonical": "node src/verify-canonical.ts",
+    "db:verify-external-ids": "node src/verify-external-ids.ts"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",

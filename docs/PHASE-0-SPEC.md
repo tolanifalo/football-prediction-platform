@@ -95,7 +95,7 @@ One table, append-only, with `superseded_at`. Not a separate history table, not 
   known_at <= :cutoff AND (superseded_at IS NULL OR superseded_at > :cutoff)
   ```
 
-**This predicate must never be hand-written.** Wrap it in a SQL function (`fn_as_of(cutoff)`) or a parameterised view per fact table, and make the feature builder physically unable to query the fact tables any other way. Every leakage bug in this system's future is a hand-written variant of that WHERE clause.
+**This predicate must never be hand-written.** Wrap it in a SQL function (`fn_as_of(cutoff)`) or a parameterised view per fact table, and make the feature builder physically unable to query the fact tables any other way. **The mechanism is owned and first implemented by P0-06** (§11.1), which creates the first bitemporal table; P0-08 consumes it. Every leakage bug in this system's future is a hand-written variant of that WHERE clause.
 
 **Enforce append-only with column-level grants**, not convention:
 
@@ -789,6 +789,234 @@ The underlying rule stands and is unchanged: NULL means "not provided", no senti
 
 ---
 
+# 11. External identity mapping (P0-06)
+
+Approved 2026-09-08 after a readiness review that identified three blocking gaps and one ownership gap. This section resolves them. It is design only — no schema, migrations or triggers exist yet.
+
+P0-06 builds the join between a provider's opaque primary keys and our canonical UUIDs. P0-04 archives what a provider *said*; P0-05 defines what we *believe*; P0-06 records **which provider key means which canonical entity**. Without it, re-ingesting the same payload cannot find the team it already created.
+
+## 11.1 The as-of mechanism belongs to P0-06
+
+**Ownership moves from P0-08 to P0-06.** *(Corrected 2026-09-08: §D previously assigned the `as_of` SQL function to P0-08, which conflicted with §E's P0-06 acceptance criterion and with §2.2.)*
+
+The reasoning is forced rather than stylistic:
+
+- **P0-06 creates the first bitemporal table.** `external_ids` is bitemporal per §2.1; nothing before it was.
+- **§2.2 states the as-of predicate must never be hand-written.**
+- **§E requires P0-06's acceptance test to perform an as-of query** — *"the as-of query returns the old mapping for a past cutoff."*
+
+Those three together mean P0-06 cannot be complete without the reusable mechanism. Building `external_ids` first and the mechanism later would require hand-writing the predicate exactly once — which is how the practice starts.
+
+**P0-06 owns and implements the mechanism. P0-08 consumes it** for `match_results` and `match_stats`, and owns neither its design nor its first implementation.
+
+The mechanism encapsulates the approved predicate and nothing else:
+
+```
+known_at <= cutoff AND (superseded_at IS NULL OR superseded_at > cutoff)
+```
+
+**This predicate must appear in exactly one place.** It must not be duplicated across application code, feature builders or verification scripts — including P0-06's own verification script, which must call the mechanism rather than restate it. Every leakage bug in this system's future is a hand-written variant of that WHERE clause (§2.2).
+
+### Settled shape
+
+*(Determined 2026-09-08 by a disposable probe on PostgreSQL 17.6 against 20,000 seeded rows. Four candidate shapes were built and measured; all four returned identical results at every cutoff, so the choice rests on planning, typing and failure modes rather than correctness.)*
+
+**One shared predicate function — the single definition:**
+
+```sql
+fn_visible_at(known_at timestamptz, superseded_at timestamptz, cutoff timestamptz)
+  RETURNS boolean
+  LANGUAGE sql IMMUTABLE PARALLEL SAFE
+```
+
+**One thin wrapper per bitemporal table, which delegates and never restates:**
+
+```sql
+<table>_as_of(cutoff timestamptz)
+  RETURNS SETOF <table>
+  LANGUAGE sql STABLE
+  -- body: SELECT * FROM <table> WHERE fn_visible_at(known_at, superseded_at, cutoff)
+```
+
+**`LANGUAGE sql` is load-bearing, not incidental.** SQL functions are inlined by the planner; PL/pgSQL functions are optimisation barriers.
+
+### Two shapes were rejected, on evidence
+
+**Rejected — a generic PL/pgSQL `anyelement` function.** It produced an opaque `Function Scan` with no predicate pushdown. With a selective outer filter it materialised **14,999 rows to return 1**, where the wrapper form used an index scan and discarded none. It also loses compile-time type safety: a table without the bitemporal columns fails at *runtime* (`ERROR: column "known_at" does not exist`).
+
+**Rejected — a GUC-based cutoff (`current_setting`) read by parameterised views.** Its planning was acceptable, but the session variable persists beyond the query: **a caller that forgets to set the cutoff silently inherits the previous one**, and under connection pooling that value can come from an unrelated request. In a system whose first rule is leakage prevention, a mechanism whose failure mode is *wrong data rather than an error* is disqualifying.
+
+### Proven properties
+
+- **Plans are identical to hand-written SQL.** Both `fn_visible_at` and the wrapper inline to exactly the filter a hand-written predicate produces.
+- **Index pushdown is preserved.** A selective outer filter through the wrapper yields `Index Scan … Index Cond: (external_id = …)`.
+- **Column typing is preserved** in full by `RETURNS SETOF <table>`.
+- **Both languages call it as an ordinary parameterised relation**, verified in the probe: TypeScript via postgres.js (`SELECT … FROM external_ids_as_of($1)`, returning typed columns with `known_at` as a JS `Date`) and Python via psycopg (`cur.execute('SELECT … FROM external_ids_as_of(%s)', (cutoff,))`). Neither needed driver-specific handling.
+
+### The single-place rule is enforced, not merely stated
+
+- `fn_visible_at` is **the only** object defining the visibility predicate.
+- Per-table wrappers **delegate**; they must not restate it.
+- Verification scripts **call the mechanism**; they must not reproduce the predicate.
+- **CI must contain a catalog assertion** that exactly one object contains the predicate logic. The probe confirmed this is machine-checkable: scanning `pg_get_functiondef` across `pg_proc` reported `restates_predicate = true` for `fn_visible_at` alone, and `false` for every wrapper. Anything that restates it — a new table's wrapper, a verification script, a feature builder — pushes that count above one and fails the build.
+
+Implementation details beyond the above were not proven by the probe and are deliberately left open.
+
+## 11.2 `entity_review_queue` — minimal and generic
+
+**Stays in P0-06.** P0-06 creates the table; **P0-12 populates and operates it.**
+
+The queue records *that a human decision is required*. It performs no matching, holds no algorithm, and is not responsible for entity resolution.
+
+Minimum required capability:
+
+| Capability | Purpose |
+|---|---|
+| Stable queue-item identity | Reference an item across sessions |
+| Entity type | Which canonical registry the item concerns (§11.4) |
+| Source | Which provider raised it |
+| External identifier | The provider key needing a decision |
+| Candidate internal entity UUID, nullable | The proposed match, where one exists |
+| Reason / category | Why review is needed (ambiguous, unverified, conflicting) |
+| Review status | Open / resolved / rejected |
+| Created timestamp | When it was raised |
+| Resolved timestamp, nullable | When it was decided |
+| Reviewer / resolution metadata | Who decided and what they chose |
+
+**Deliberately excluded:** provider-specific columns, match scores, algorithm parameters, thresholds, and any column whose meaning cannot be determined without inventing a requirement. Where exact semantics are unclear, **the smallest defensible generic design wins** — P0-12 knows what it needs to record and can extend the table by ordinary migration.
+
+The candidate UUID is nullable because the common case at scale is *"this provider key matches nothing we know"*, which has no candidate.
+
+**`reason` is free text, not a closed set.** *(Recorded 2026-09-08 from the P0-06 implementation.)* The categories named above — ambiguous, unverified, conflicting — are **illustrative, not an enumeration.** Constraining `reason` with a `CHECK` would fix P0-12's vocabulary before P0-12 exists, on no authority in this specification. **P0-12 owns the semantics of `reason`** and may narrow it by ordinary migration once it knows what it needs to record. The column is constrained only to be non-empty.
+
+## 11.3 Polymorphic `internal_id`, enforced by trigger
+
+The approved design is retained without modification: **one polymorphic column, `external_ids.internal_id uuid`**, with `entity_type` selecting the canonical registry table.
+
+Explicitly rejected: five nullable typed FK columns; a new entity supertype or registry table; abandoning the polymorphic design. §10.5 already made the UUID consistency of the five registries load-bearing for exactly this.
+
+A single column cannot carry a conventional foreign key to five tables. Integrity is therefore **trigger-enforced polymorphic referential integrity**, and must be documented and read as such — it is not an FK, and `information_schema` will not report it as one.
+
+The invariant, in full:
+
+1. On INSERT, `internal_id` **must exist** in the canonical table named by `entity_type`.
+2. `entity_type` must be one of the valid canonical types (§11.4).
+3. `internal_id` and `entity_type` are **immutable after insert**.
+4. A canonical entity **must not be deletable** while an `external_ids` row references it.
+5. **Remapping happens by superseding the old mapping and inserting a new one — never by rewriting `internal_id` in place.**
+
+Rule 5 is the one with teeth. An in-place rewrite silently re-attributes every historical fact that was ingested under the old mapping, and it is invisible to any test that checks only current state. Rules 3 and 5 together are the schema-level expression of §6 rule 9's **"Never auto-remap."**
+
+Rule 4 deserves note because it inverts the usual direction: the canonical tables are protected *by* the mapping table, which a conventional FK would normally do for free. P0-05 already withholds `DELETE` on `teams`, `competitions` and `seasons` from `engine_rw` (§10.6), so this trigger is defence in depth rather than the only guard — but `countries` and `venues` do allow `DELETE`, and there the trigger is the guard.
+
+**Which layer rejects, and with which SQLSTATE.** *(Recorded 2026-09-08 from the P0-06 implementation.)*
+
+PostgreSQL evaluates a `BEFORE ROW` trigger **before** it evaluates `CHECK` constraints. An invalid `entity_type` therefore reaches the trigger first and is rejected as `23503` (`foreign_key_violation`) rather than by the column's `CHECK` as `23514`. **Both are valid rejection paths and both are present; the invariant — that the row cannot be written — is what matters.** Verification must accept either code rather than asserting one.
+
+Attempts to change the immutable `internal_id` or `entity_type` raise **`23001` (`restrict_violation`)**, chosen deliberately so an immutability breach is distinguishable from a missing reference (`23503`) at a glance in logs.
+
+**SQLSTATE values are an implementation detail, not an architectural contract.** They are recorded here so verification and operational tooling can rely on today's behaviour, not to freeze it. Only the invariants in the numbered list above are binding.
+
+**Temporal behaviour of `now()`.** PostgreSQL's `now()` is the **transaction timestamp** and is stable for the life of a transaction: two calls inside one transaction return the identical instant. Consequently a mapping inserted and superseded **within the same transaction** must set `superseded_at` to an explicitly later instant, or it will violate the `superseded_at > known_at` invariant. This is a testing consideration rather than an operational one — **normal supersession happens in a later transaction**, where `now()` has advanced. The `superseded_at > known_at` invariant is preserved unchanged; zero-length validity remains disallowed.
+
+**Triggers are not implemented in this task.** This section is their specification.
+
+### Settled trigger design
+
+*(Determined 2026-09-08 by a disposable probe on PostgreSQL 17.6. All fourteen invariant probes passed, including under P0-05's real grant model.)*
+
+**Mapping-side — `BEFORE INSERT OR UPDATE ON external_ids`:**
+
+- Resolve `entity_type` to its canonical registry and verify `internal_id` exists there.
+- Perform that check with **`SELECT … FOR KEY SHARE`** on the referenced canonical row (see the race decision below).
+- Reject any change to `internal_id` or `entity_type` after insert.
+- Permit changes to `superseded_at`, `confidence` and `last_verified_at`.
+- Raise `foreign_key_violation` (23503) so the failure reads like the FK it emulates.
+
+**Canonical-side — `BEFORE DELETE` on each of `countries`, `competitions`, `seasons`, `teams`, `venues`:**
+
+- Reject deletion while any `external_ids` row references the entity.
+
+**Both sides are required.** This was proved, not assumed: with the canonical-side trigger dropped, deleting a mapped team succeeded and left **1 orphaned mapping** pointing at a row that no longer existed. The mapping-side trigger validates only at insert time and cannot prevent a later delete; the canonical-side trigger cannot validate a mapping being created. Neither alone is sufficient.
+
+Rule 4's protection is not redundant with P0-05's grants. `engine_rw` genuinely holds `DELETE` on `countries` and `venues` (§10.6), and the probe confirmed that under `SET LOCAL ROLE engine_rw` the delete is stopped **only** by the trigger.
+
+### This is not a foreign key
+
+It is **trigger-enforced polymorphic referential integrity**. `information_schema.table_constraints` will not list it, and `drizzle-kit` will not see it. Nothing in the ordinary toolchain will tell you it is missing or broken.
+
+**It therefore requires explicit verification.** The absence of a constraint the tooling never reports is invisible until data is already wrong.
+
+### Race decision: `FOR KEY SHARE`, not weaker-than-FK semantics
+
+The probe established that a plain `SELECT EXISTS` check takes **no lock on the canonical row**. Under READ COMMITTED, a session inserting a mapping and a session deleting the same entity can interleave, leaving an orphan — a window a real foreign key closes by taking a `KEY SHARE` lock.
+
+**The production design closes that window with `SELECT … FOR KEY SHARE`.** Accepting the window was considered and rejected: the whole purpose of §11.3 is to obtain FK-equivalent integrity for a polymorphic column, and a mechanism that is FK-like except under concurrency is a mechanism that fails exactly when it is hardest to debug.
+
+### Errors are transaction-safe
+
+Trigger failures raise a clean SQLSTATE with a legible message and leave the transaction usable after `ROLLBACK TO SAVEPOINT` — verified in the probe across two consecutive failures. Verification must use the savepoint pattern established by `verify-canonical` (§10) for negative probes.
+
+### TRUNCATE
+
+`TRUNCATE` bypasses row-level triggers entirely, so a `TRUNCATE` on a canonical table would orphan mappings silently.
+
+**No `BEFORE TRUNCATE` trigger is added unless a need is demonstrated.** Instead: **application roles must not hold `TRUNCATE` privilege on the canonical tables or on `external_ids`.** `TRUNCATE` is not granted by P0-05 or P0-06 and must not be added.
+
+Administrative and retention roles that might legitimately hold it are **outside P0-06 scope**.
+
+## 11.4 `entity_type` is TEXT with a CHECK constraint
+
+Not a PostgreSQL enum. Consistent with every constrained column in P0-05, extensible by ordinary migration, and free of `ALTER TYPE` ceremony.
+
+Permitted values — the five UUID-keyed canonical registries, and only those:
+
+```
+country · competition · season · team · venue
+```
+
+The child tables (`team_names`, `competition_names`, `team_aliases`) are `bigint`-keyed by the §10.5 exception and are deliberately **not** mappable: providers do not have primary keys for a name row.
+
+## 11.5 `confidence` — storage here, meaning in P0-12
+
+**P0-06 owns storage** of `confidence` and `last_verified_at`. It defines their type and nullability and nothing more.
+
+**P0-12 owns interpretation** — what a value means, what threshold gates an auto-match, when a mismatch drops confidence, and what fires a review item.
+
+**P0-06 must not invent a numerical threshold or a matching algorithm.** A threshold chosen before any matching exists would be a guess that later code would inherit as though it were a decision.
+
+Per §6 rule 9, the nightly job that re-verifies mappings and drops confidence is **Phase 1** work — Phase 0 has no scheduler (§G). P0-06 provides the columns that job will write.
+
+## 11.6 `fixture_match_candidates` belongs to P0-12
+
+*(Ownership gap closed 2026-09-08. It was named in §B and §6 rule 10 without ever being assigned to a task.)*
+
+It is resolution machinery — cross-provider duplicate scoring on teams, ±3 days and competition — not foundational identity mapping. **P0-12 owns entity resolution and review workflows, and owns this table.** P0-06 does not create it.
+
+`competition_coverage` remains deferred as decided in §10.9.
+
+## 11.7 Scope boundary
+
+**P0-06 establishes the mechanism and the schema — nothing that interprets them.** It creates: `fn_visible_at` and the first `<table>_as_of` wrapper (§11.1), `external_ids`, `entity_review_queue` (§11.2), the mapping-side and canonical-side integrity triggers (§11.3), grants, a verification script that calls the as-of mechanism rather than restating its predicate, and the CI catalog assertion enforcing the single-place rule.
+
+Ownership of everything adjacent, stated so no later task has to re-derive it:
+
+| Concern | Owner |
+|---|---|
+| As-of mechanism — design and first implementation | **P0-06** |
+| As-of mechanism — consumption for `match_results`, `match_stats` | **P0-08** (consumes; owns neither) |
+| Resolution and matching semantics, `confidence` interpretation, thresholds | **P0-12** |
+| `entity_review_queue` — population and operational use | **P0-12** (P0-06 creates the empty table) |
+| `fixture_match_candidates` | **P0-12** (§11.6) |
+| Nightly mapping re-verification job | **Phase 1** — Phase 0 has no scheduler (§G) |
+| Administrative / retention roles, `TRUNCATE` privilege | Outside P0-06 (§11.3) |
+
+**Read-only consumers.** *(Recorded 2026-09-08 from the P0-06 implementation.)* `app_rw` and `analytics_ro` hold `SELECT` on **both** `external_ids` and `entity_review_queue`. This is intentional: the admin data-status page (ARCHITECTURE.md §8) and analytics both need to see mapping state and the review backlog. **Neither role holds any mutation privilege** — no `INSERT`, `UPDATE`, `DELETE`, and no `TRUNCATE` on either table, nor on the canonical tables (§11.3).
+
+P0-06 does **not** create: any matching, scoring or fuzzy-resolution logic, `fixture_match_candidates`, the nightly re-verification job, provider adapters (P0-10), or any change to P0-05 canonical schema.
+
+---
+
 # A. Final architecture
 
 Unchanged from `ARCHITECTURE.md` in shape — three deployables, database as the engine↔app interface, one scoreline matrix deriving all markets. Four amendments:
@@ -814,7 +1042,7 @@ Unchanged from `ARCHITECTURE.md` in shape — three deployables, database as the
 
 **Evaluation** — `prediction_outcomes` (bitemporal), `model_performance`.
 
-**Review queues** — `entity_review_queue`, `fixture_match_candidates`.
+**Review queues** — `entity_review_queue` (table created in **P0-06**, §11.2; populated by P0-12), `fixture_match_candidates` (**P0-12**, §11.6).
 
 **Application** — deferred entirely to Phase 5. Not built in Phase 0.
 
@@ -831,13 +1059,13 @@ Championship 2023/24 · consensus ground truth with manual adjudication of disag
 | **P0-03** | Drizzle harness: config with the `schema` glob scoped per §8.1, `generate` + `migrate` scripts, **one `--custom` SQL migration and one raw-SQL-owned table proven outside the glob**, plus the `db:verify-generate` CI check | 02 |
 | **P0-04** | Provenance core per §9: `data_sources`, `job_runs`, `raw_payload_bodies` (Drizzle), `raw_payloads` partitioned monthly + `DEFAULT` + `v_raw_payload_seen` (raw-SQL), grants, plus `db:verify-partitions` | 03 |
 | **P0-05** | Canonical entities: countries, competitions, `competition_names`, seasons, teams (no name column), `team_names`, aliases, venues | 03 |
-| **P0-06** | `external_ids` (bitemporal) + `entity_review_queue` | 04, 05 |
+| **P0-06** | Per §11: the reusable **as-of mechanism** (§11.1), `external_ids` (bitemporal, polymorphic `internal_id` with trigger-enforced integrity), `entity_review_queue` (minimal, generic), grants | 04, 05 |
 | **P0-07** | Fixture identity: `fixtures` + `fixture_schedule` (bitemporal), ties, legs, replays | 05 |
-| **P0-08** | Bitemporal facts: `match_results`, `match_stats`, the `as_of` SQL function, and **column-level grants** | 04, 07 |
+| **P0-08** | Bitemporal facts: `match_results`, `match_stats`, and **column-level grants**. **Consumes** the as-of mechanism built in P0-06 — *[CORRECTED 2026-09-08]* this row previously claimed ownership of the `as_of` SQL function; see §11.1 | 04, 07 |
 | **P0-09** | Odds model: `bookmakers`, `odds_series`, `odds_ticks`, `odds_coverage` | 04, 07 |
 | **P0-10** | `ProviderAdapter` interface + canonical DTOs + an adapter contract test suite any adapter must pass | 04 |
 | **P0-11** | Adapter #1 — football-data.co.uk CSV (results **and** odds; free, no key, exercises the whole pipeline) | 10 |
-| **P0-12** | Entity resolution: alias matching, fuzzy candidates, review queue population | 06, 11 |
+| **P0-12** | Entity resolution: alias matching, fuzzy candidates, **`fixture_match_candidates`** (§11.6), review queue population, and the semantics of `confidence` (§11.5) | 06, 11 |
 | **P0-13** | Historical import: 3 leagues × 5 seasons of results and odds, with full provenance | 08, 09, 12 |
 | **P0-14** | Validation and reconciliation suite: data-quality assertions + cross-source reconciliation | 13 |
 | **P0-15** | Reproducibility harness: `dataset_snapshots`, `model_versions`, `training_runs`, `feature_snapshots`, `reproduce.py` with **L1 and L2 against a placeholder model** | 08 |
@@ -856,7 +1084,7 @@ Phase 0 ends at P0-18, not P0-17. **The waiting period is part of the plan** —
 | P0-03 | Three proofs, none of which may use `tablesFilter` (§8.2): **(1)** a real Drizzle-managed table produces a migration, and repeated `drizzle-kit generate` runs on the unchanged schema produce an empty diff; **(2)** a `--custom` SQL migration applies successfully and is recorded in the same migration ledger; **(3)** a raw-SQL-owned table declared outside the Drizzle `schema` glob is fully typed and queryable but is **not emitted** by `generate`, and repeated generation stays clean. Plus `db:verify-generate` running in CI as a schema-input consistency check — **not** described or relied on as database drift detection (§8.3) |
 | P0-04 | Fetching the same body twice yields **one `raw_payload_bodies` row and two `raw_payloads` rows**, with `v_raw_payload_seen.seen_count = 2` (§9.3); 12 monthly partitions plus `DEFAULT` exist; a partition drop leaves other data intact; `engine_rw` is **refused** `UPDATE` and `DELETE` on both archive tables; deleting a referenced body is refused by `ON DELETE RESTRICT`; and **`db:verify-partitions` asserts all six invariants in §9.5** — including that `DEFAULT` is empty and that a routing probe reaches the current month's partition — failing loudly on any violation |
 | P0-05 | Eight tables per §10, all Drizzle-managed, plus one custom grants migration. A team can be renamed and both the historical and the current name resolve correctly at their respective dates; `teams` has no name column. A **second current** `(team_id, name_type)` or a second current season per competition is **rejected by a partial unique index**, while two historical rows and a historical+current pair are accepted (§10.4). `engine_rw` is refused `UPDATE` on `team_names.name` and permitted `UPDATE (valid_to)` (§10.6). No participation table, no `external_ids`, no `competition_coverage` |
-| P0-06 | An external ID remapped to a different internal entity leaves the old mapping intact with `superseded_at` set; the as-of query returns the old mapping for a past cutoff |
+| P0-06 | **As-of mechanism (§11.1):** every as-of read goes through `fn_visible_at` or a `<table>_as_of` wrapper — no caller, including the verification script, restates the predicate; a **CI catalog assertion proves exactly one object contains the predicate logic**; the wrapper is callable from **both TypeScript and Python**; and a selective filter through the wrapper still yields an **index scan**, not a function scan. **Bitemporal behaviour:** an external ID remapped to a different internal entity leaves the old mapping intact with `superseded_at` set, and the as-of query returns the old mapping for a past cutoff. **Uniqueness:** many external IDs may map to one internal ID; one external ID mapping to two current internal IDs is rejected by the partial unique. **Integrity (§11.3):** the mapping-side trigger validates `internal_id` against the registry named by `entity_type` **using `SELECT … FOR KEY SHARE`**, rejects mutation of `internal_id`/`entity_type`, and permits `superseded_at`/`confidence`/`last_verified_at`; the canonical-side trigger **blocks deletion of a referenced entity even where `engine_rw` holds `DELETE`**; trigger failures are **transaction-safe under `ROLLBACK TO SAVEPOINT`**; and **no application role holds `TRUNCATE`** on the canonical tables or `external_ids`. `entity_review_queue` exists and is empty — P0-06 writes no review items |
 | P0-07 | Both legs of a two-legged tie insert without violating the unique constraint; a replay inserts as a new fixture linked by `replaces_fixture_id`; a reschedule creates a schedule revision, **not** a duplicate fixture |
 | P0-08 | **The §2.3 worked example passes as an automated test** — insert 2–1, insert the 2–2 correction, and assert the as-of query at T2 returns 2–1 while the current query returns 2–2. An `UPDATE` on a score column is **rejected by the database** for `engine_rw` |
 | P0-09 | Polling an unchanged price twice writes **one** tick; a suspension writes a tick with `is_available = false`; `odds_coverage` distinguishes "not polled" from "unchanged" |

@@ -50,6 +50,20 @@
       "when": 1788853924910,
       "tag": "0006_p0_05_canonical_grants",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1788867022900,
+      "tag": "0007_p0_06_external_identity",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1788867036614,
+      "tag": "0008_p0_06_asof_triggers_grants",
+      "breakpoints": true
     }
   ]
 }
