@@ -23,6 +23,7 @@
     "db:verify-canonical": "pnpm --filter @fpp/db db:verify-canonical",
     "db:verify-external-ids": "pnpm --filter @fpp/db db:verify-external-ids",
     "db:verify-fixtures": "pnpm --filter @fpp/db db:verify-fixtures",
+    "db:verify-facts": "pnpm --filter @fpp/db db:verify-facts",
     "verify": "pnpm -r typecheck && pnpm -r lint && pnpm py:lint && pnpm py:typecheck && pnpm py:test"
   },
   "devDependencies": {

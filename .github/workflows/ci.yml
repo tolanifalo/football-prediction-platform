@@ -47,6 +47,7 @@ jobs:
       - run: pnpm db:verify-canonical
       - run: pnpm db:verify-external-ids
       - run: pnpm db:verify-fixtures
+      - run: pnpm db:verify-facts
 
   python:
     runs-on: ubuntu-latest

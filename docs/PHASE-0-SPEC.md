@@ -1253,6 +1253,159 @@ The verifier must be **meta-tested** by deliberately breaking an invariant, must
 
 ---
 
+# 13. Match facts — results and statistics (P0-08)
+
+Approved 2026-09-08 after a design review that ran six disposable probes on PostgreSQL 17.6 and drizzle-kit 0.31.10. Twelve decisions (E1–E12) were ruled, one of them — the treatment of abandoned fixtures — by explicit instruction rather than by default.
+
+P0-08 records **what happened in the match**. `fixtures` says which contest, `fixture_schedule` says when and in what administrative state, and these two tables say what the football was. Both are **fully bitemporal** (§2.1) and **append-only**: a correction appends a revision and closes the old one, and nothing is ever overwritten. That is what makes §2.3's worked example — and every backtest built on it — honest rather than merely plausible.
+
+P0-08 **consumes** the as-of mechanism and owns neither its design nor its first implementation (§11.7).
+
+## 13.1 Scope
+
+**Owns:** `match_results`, `match_stats`, the two `<table>_as_of` wrappers, grants on both, and `db:verify-facts`.
+
+**Dependencies are 04, 06 and 07** — `data_sources` and `raw_payload_bodies` for provenance, `fn_visible_at` for visibility, `fixtures` as the identity anchor. *(§D's task row read `04, 07` until corrected 2026-09-08; it omitted P0-06.)*
+
+**Does not own:** `match_events` (Phase 8, §G) · odds and bookmakers (P0-09) · provider adapters (P0-10/11) · ingestion of any kind · `fixture_match_candidates` and entity resolution (P0-12) · `competition_coverage` (§10.9, deferred) · `standings`, `predictions`, `team_ratings`, backtesting, the value engine, or anything visible.
+
+## 13.2 `match_results`
+
+One row per **(fixture, source, revision)**.
+
+| Column | Notes |
+|---|---|
+| `fixture_id` | FK to `fixtures.id`. Canonical identity only — never a provider key |
+| `result_source` | `'played'` or `'awarded'`, and **only** those two |
+| `is_trainable` | boolean, NOT NULL |
+| `ht_home` / `ht_away` | nullable — not every source reports half-time |
+| `ft_home` / `ft_away` | **NOT NULL** — a result without a full-time score is not a result |
+| `aet_home` / `aet_away` | **cumulative at the end of extra time** |
+| `pens_home` / `pens_away` | shootout only |
+| `occurred_at` | valid time: when the match concluded |
+| `source_id`, `raw_payload_body_id`, `known_at` | provenance, all NOT NULL (§1.3) |
+| `superseded_at` | NULL = current belief |
+
+**`aet_*` is cumulative, not incremental** *(E3)*. A match finishing 2–2 after ninety minutes and 3–2 after extra time stores `ft 2-2, aet 3-2` — not `aet 1-0`. Both readings are common in the wild, and choosing silently corrupts every knockout match. The `aet >= ft` constraint is sound only under this reading, which is precisely why the ambiguity is settled in the schema rather than left to each ingester.
+
+**Penalties are never goals** *(E11 in spirit)*. A shootout decides a tie; it is not football scoring and must never reach the goals model. Separate columns are how the schema keeps that true, and `pens` requires `aet` and may not be drawn.
+
+**The winner is derived, never stored** *(E10)*. It is a pure function of `(ft, aet, pens)`. A stored copy is a second source of truth that can disagree with the scores beside it.
+
+**There is no `revision` column** *(E9 / F4)*. `DECISIONS-01` §A and §7 mention `(known_at, revision, superseded_at)`, and §2.3's illustrative table shows a `revision` column. It is illustrative only: §2.2's pattern is `known_at` + `superseded_at`, and neither `external_ids` (P0-06) nor `fixture_schedule` (P0-07) carries one. Ordering is by `known_at`.
+
+**`occurred_at`, not `settled_at`** *(E8 / F3)*. `ARCHITECTURE.md` §3.2 names `settled_at`, which is ambiguous under bitemporality — settlement is neither valid nor transaction time. §2.1 names the valid-time axis `occurred_at` and §2.3 uses it. Note the deliberate asymmetry with `fixture_schedule`, which carries no valid-time column: there, "when was this true" was already answerable from `kickoff_utc`; here there is no other column recording when the match was played.
+
+**Constraints**, every one probe-verified: `result_source IN ('played','awarded')` · `result_source <> 'awarded' OR is_trainable = false` · `ft_* >= 0` · half-time pair present or absent together, and `ht_* <= ft_*` · extra-time pair together, and `aet_* >= ft_*` · penalties pair together, require extra time, and may not be level · `superseded_at > known_at`.
+
+## 13.3 `match_stats`
+
+One row per **(fixture, source, revision)**, with **home/away paired columns**.
+
+**Not one row per team.** The reasons are concrete and were measured:
+
+- **The plausibility rule §3.3 requires is a single-row `CHECK` here and is impossible per-team.** "Possession pair sums to 100 ±1" needs both sides in one row; a `CHECK` cannot contain a subquery (`0A000`).
+- **There is no `team_id`.** Policing it would need a `CHECK` reading `fixtures`, and that was proven **unsound**: such a constraint is accepted and does reject a foreign team at write time, but the fixture can then be repointed and the stored row is **silently invalidated**. A cross-table `CHECK` is a write-time assertion, not a constraint. The paired shape makes the invalid state unrepresentable instead.
+- **There is no `is_home`.** It duplicates `fixtures.home_team_id`.
+- **There is no `xga`.** One team's expected goals against **is** the other team's expected goals — two columns holding one fact, guaranteed to diverge. `ARCHITECTURE.md` §3.2 specified all three; that row is superseded.
+
+**Metric set** — exactly §3.3's fill-rate list plus xG, the only authoritative field list in this specification and the one the bake-off scores:
+
+```
+shots · shots_on_target · corners · fouls · yellow_cards · red_cards · possession · xg
+```
+
+each as a `home_*` / `away_*` pair. **Deferred** to the task that needs them: deep completions, PPDA, passes, lineups, formations, player-level data, and per-period splits. Adding one is an ordinary migration.
+
+**NULL means "not provided". Zero means zero** (§6 rule 12). No column defaults to `0`, ever. A sentinel here is a silent modelling error: the model cannot distinguish "no shots" from "we don't know".
+
+**Types.** Counts are `smallint`. Possession is `numeric(5,2)` and xG `numeric(6,3)` — **exact numeric, never floating point** *(E11)*. §5.2 names floating-point reduction order as a determinism hazard, and a reproducibility harness that cannot reproduce its own inputs is worthless.
+
+**Statistics revise independently of results** *(E-indep)*. Separate tables, separate `known_at`, separate supersession. xG routinely lands days after a score is final, which is why §2.1 bitemporalises both rather than treating a match as one fact.
+
+## 13.4 Abandoned fixtures — what is and is not canonical result truth
+
+*(Ruled 2026-09-08. This is E5, the one decision with no defensible default.)*
+
+**An abandoned fixture does NOT receive a `match_results` row merely because an authoritative source observed a partial score.** A score at the moment of abandonment is an **upstream observation** — evidence about what a provider said — and not canonical match-result truth.
+
+**Partial scores observed before or at abandonment remain preserved in the raw ingestion and provenance layer** (`raw_payload_bodies`, `raw_payloads`, §9). They are never discarded; they are simply not promoted to a canonical result. This is the §9.3 distinction doing its work: *payloads are what the provider actually said; facts are what we believe.*
+
+A `match_results` row may exist for an abandoned fixture **only** if an authoritative source explicitly reports an **awarded** result, and then only as:
+
+```
+result_source = 'awarded'
+is_trainable  = false
+```
+
+| Situation | Canonical `match_results` |
+|---|---|
+| Abandoned at 1–0 | **no row** |
+| Later officially awarded 3–0 | one row: `awarded`, `is_trainable = false`, 3–0 |
+| Completed normally at 1–0 | one row: `played`, normal trainability rules |
+
+**No third `result_source` value is added for abandoned matches**, and none may be. §6 rule 3 governs the reason: *awarded scores are administrative outcomes and must never train the goals model — they still settle bets.* A 3–0 walkover is a real settlement fact and a fictional football fact, and the schema keeps them apart rather than inventing a category that blurs them.
+
+**Which half of this is enforced, stated plainly.** The database enforces that `result_source` has exactly two values and that an awarded result can never be trainable. It **cannot** enforce that no partial score is written for an abandoned fixture — status lives on `fixture_schedule`, a different bitemporal table with its own timeline, and a cross-table `CHECK` was proven unsound (§13.3). That half is an ingestion rule and a **P0-14 assertion**, and `db:verify-facts` says so rather than implying a constraint that does not exist.
+
+## 13.5 Multi-source truth — the business key
+
+**The current-row business key is `(fixture_id, source_id)`, not `(fixture_id)`** *(E1)*.
+
+This was the one genuinely load-bearing decision, and it was settled by evidence rather than taste. Under a `(fixture_id)`-only partial unique index, a second provider asserting the same match is **rejected with `23505`** — its truth is unrepresentable. That would contradict `DECISIONS-01` §A ("Two providers may assert the same fixture; reconciliation picks a winner and records the disagreement rather than overwriting") and would make the §3.3 bake-off metrics — *Results — FT: exact full-time score match*, *xG agreement: Pearson r against another provider on shared fixtures* — impossible to compute from the canonical tables. §3.6 requires the bake-off to run through the real pipeline, not a throwaway script; a schema that cannot hold two providers' answers cannot host it.
+
+Under `(fixture_id, source_id)` both current rows coexist, the disagreement is a query rather than a loss, and a genuine **same-source** duplicate is still rejected `23505`.
+
+**Consequence, stated so no later task has to rediscover it:** "the result of fixture F" is not a single row. A reader must name a source, or apply a selection rule that P0-08 does not define.
+
+## 13.6 What P0-08 deliberately does not decide
+
+- **No source-precedence or reconciliation rule** *(E2)*. P0-08 stores disagreement; it does not resolve it. Reconciliation is **P0-14**. Until the bake-off decides (P0-18), Phase 0 has one free provider (P0-11), so in practice a single source is read — but that is an operational fact to be stated at the point of use, **not** a rule to be improvised inside P0-13 or P0-15.
+- **`stats_complete_at` gets no setter.** The column lives on `fixtures` (P0-07) and §6 rule 13 defines it as set "when every field the coverage profile marks `always` is present" — but §10.9 removed `competition_coverage` with no replacement and no owner. **Its ownership remains deferred**, and P0-08 must not invent a coverage rule to fill the gap.
+- **No cross-table temporal assertions.** That a result exists only for a fixture whose status was plausible at the same cutoff spans two bitemporal tables and cannot be constrained. P0-14's assertion suite owns it.
+- **No `shots_on_target >= goals` check.** It spans `match_stats` and `match_results`; §3.3 lists it as a bake-off plausibility metric, not a constraint.
+
+## 13.7 Indexes
+
+```
+match_results   UNIQUE (fixture_id, source_id) WHERE superseded_at IS NULL   -- business key
+                (fixture_id)                                                 -- FULL, not partial
+match_stats     the same two
+```
+
+**The full index is not optional, and the partial one cannot replace it.** Measured: with the full index the as-of lookup is a Bitmap Index Scan; without it, a sequential scan. The partial index is restricted to `superseded_at IS NULL`, while the visibility predicate also admits rows whose `superseded_at` is **later than the cutoff** — so it can serve the settlement path and never a historical read. This is the P0-07 finding (§12.8), re-measured on this table shape.
+
+**No index on `known_at`**, following §12.8. The bulk training scan — every trainable result as-of a cutoff — plans as a sequential scan, which is correct and cheap at the Phase 0 ceiling.
+
+## 13.8 Permissions
+
+The §2.2 pattern verbatim, as in P0-06 and P0-07:
+
+```sql
+GRANT SELECT, INSERT ON match_results, match_stats TO engine_rw;
+GRANT UPDATE (superseded_at) ON match_results TO engine_rw;
+GRANT UPDATE (superseded_at) ON match_stats   TO engine_rw;
+GRANT SELECT ON match_results, match_stats TO app_rw, analytics_ro;
+```
+
+**No `DELETE` and no `TRUNCATE`, to any role.** A corrected result is a new revision, never a deletion, and `TRUNCATE` would additionally bypass every row-level protection (§11.3).
+
+The engine can append a revision and close the old one. It cannot rewrite a score, a half-time score, a penalty tally, an xG, `is_trainable`, `result_source`, or any provenance column. That is the §E acceptance criterion — *"an `UPDATE` on a score column is rejected by the database for `engine_rw`"* — and PostgreSQL enforces it, not code review.
+
+## 13.9 Migration and verification
+
+**Generated:** `0012_p0_08_match_facts.sql` — two tables, 6 foreign keys, 4 indexes, 17 `CHECK` constraints. Drizzle 0.45.2 expresses every element with no workaround.
+
+**`--custom`:** `0013_p0_08_asof_grants.sql` — the two as-of wrappers (`CREATE FUNCTION` is not Drizzle-expressible) and the grants (column-level `GRANT` is not). **No triggers on either table.**
+
+Both wrappers **delegate** to `fn_visible_at` and never restate the predicate. The P0-06 catalog assertion now spans **four** wrappers and must still find exactly one object defining the visibility comparison — restating it in either wrapper fails CI, by design.
+
+**`db:verify-facts` asserts 111 invariants**, including: the §2.3 worked example as an automated test — insert 2–1, insert the 2–2 correction, and confirm the as-of read at T2 returns **2–1** while the current read returns **2–2**, with both revisions retained and `occurred_at` shared; every scoreline constraint; the E5 abandoned-fixture behaviour; multi-source coexistence and same-source duplicate rejection; independent revisioning of stats against an unchanged result; provenance columns NOT NULL; zero versus NULL; the absence of `team_id`, `is_home`, `xga`, `revision`, `settled_at`, `winner` and `competition_id`; the exact index set; grants positive and negative for all three roles; wrapper delegation and the single-place catalog assertion; no `Function Scan`; and that no P0-09+ table exists.
+
+It is **meta-tested** by breaking several invariants at once and confirming a non-zero exit, and every expected-failure probe is `SAVEPOINT`-isolated so one rejection cannot poison the rest.
+
+---
+
 # A. Final architecture
 
 Unchanged from `ARCHITECTURE.md` in shape — three deployables, database as the engine↔app interface, one scoreline matrix deriving all markets. Four amendments:
@@ -1270,7 +1423,7 @@ Unchanged from `ARCHITECTURE.md` in shape — three deployables, database as the
 
 **Fixtures** — `fixtures` (identity: `season_id, stage, leg, replay_number, home_team_id, away_team_id`; plus `tie_id`, `replaces_fixture_id`, `stats_complete_at`), `fixture_schedule` (bitemporal). *Fully specified in **§12** (P0-07), which fixes the six identity columns as `NOT NULL`, adds `is_neutral_venue` to `fixture_schedule`, and rules out `competition_id`, `matchweek` and a `ties` table.*
 
-**Facts** — `match_results` (bitemporal, `is_trainable`, `result_source`), `match_stats` (bitemporal), `match_events` (deferred to Phase 8, schema reserved).
+**Facts** — `match_results` (bitemporal, `is_trainable`, `result_source`, `occurred_at`), `match_stats` (bitemporal, **one row per (fixture, source, revision) with home/away paired columns — no `team_id`, no `is_home`, no `xga`**), `match_events` (deferred to Phase 8, schema reserved). *Both fully specified in **§13** (P0-08); the current-row business key is `(fixture_id, source_id)`, not `(fixture_id)`.*
 
 **Odds** — `bookmakers`, `odds_series` (with `reference_price`, `reference_price_kind`), `odds_ticks`, `odds_coverage`.
 
@@ -1297,7 +1450,7 @@ Championship 2023/24 · consensus ground truth with manual adjudication of disag
 | **P0-05** | Canonical entities: countries, competitions, `competition_names`, seasons, teams (no name column), `team_names`, aliases, venues | 03 |
 | **P0-06** | Per §11: the reusable **as-of mechanism** (§11.1), `external_ids` (bitemporal, polymorphic `internal_id` with trigger-enforced integrity), `entity_review_queue` (minimal, generic), grants | 04, 05 |
 | **P0-07** | Fixture identity: `fixtures` + `fixture_schedule` (bitemporal), ties, legs, replays | 04, 05, 06 — *[CORRECTED 2026-09-08]* this row previously read `05` alone. `fixture_schedule` carries `source_id` and `raw_payload_body_id` (P0-04) and is read through `fn_visible_at` (P0-06). See §12.1 |
-| **P0-08** | Bitemporal facts: `match_results`, `match_stats`, and **column-level grants**. **Consumes** the as-of mechanism built in P0-06 — *[CORRECTED 2026-09-08]* this row previously claimed ownership of the `as_of` SQL function; see §11.1 | 04, 07 |
+| **P0-08** | Bitemporal facts: `match_results`, `match_stats`, and **column-level grants**. **Consumes** the as-of mechanism built in P0-06 — *[CORRECTED 2026-09-08]* this row previously claimed ownership of the `as_of` SQL function; see §11.1 | 04, 06, 07 — *[CORRECTED 2026-09-08]* previously `04, 07`, which omitted `fn_visible_at`; see §13.1 |
 | **P0-09** | Odds model: `bookmakers`, `odds_series`, `odds_ticks`, `odds_coverage` | 04, 07 |
 | **P0-10** | `ProviderAdapter` interface + canonical DTOs + an adapter contract test suite any adapter must pass | 04 |
 | **P0-11** | Adapter #1 — football-data.co.uk CSV (results **and** odds; free, no key, exercises the whole pipeline) | 10 |
