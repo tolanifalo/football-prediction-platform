@@ -23,7 +23,7 @@ These are expensive or impossible to retrofit. Do not relax one without an expli
 2. **Features only read facts with `known_at <= data_cutoff`**, via the `as_of` SQL function. Never hand-write that predicate — every future leakage bug will be a hand-written variant of it.
 3. **Fact tables are append-only.** Corrections insert a new revision and set `superseded_at`. Enforced by column-level GRANT, not convention.
 4. **Fixture identity never contains kickoff time** — `(season_id, stage, leg, replay_number, home_team_id, away_team_id)`. Rescheduling must not create a duplicate.
-5. **`teams` has no name column.** Names live in `team_names` with validity ranges.
+5. **`teams` has no name column.** Names live in `team_names` with validity ranges, half-open `[valid_from, valid_to)`. Names are **closed, never edited** — `GRANT UPDATE (valid_to)` only (§10.6).
 6. **Every fact row carries `source_id`, `raw_payload_body_id`, `known_at`.** No exceptions. The body reference is a single-column FK to the unpartitioned `raw_payload_bodies`; keeping it single-column is why the raw archive is split (`PHASE-0-SPEC.md` §9.1).
 7. **A price is only "closing" if the source defines it as closing.** Our own last observation is `last_observed_pre_kickoff` and is not the same thing.
 8. **Odds ticks are written only on change**, never per poll.
@@ -62,5 +62,8 @@ pnpm py:test:db             # database-backed tests (uv run pytest -m db)
 - Always pass `--name` when generating a migration. Auto-generated random names are not acceptable.
 - **Raw payloads are evidence, not belief.** `raw_payload_bodies` and `raw_payloads` are strictly immutable: no `UPDATE`, no `DELETE`, no `superseded_at`. A provider correction is new bytes, not an edit. Only derived facts get revised (§9.3).
 - **Primary keys** (convention, not a technical requirement): UUID for registry/reference entities, `bigint` identity for append-only log-style high-volume tables (§9.7).
+- **Names are display truth; aliases are matching strings.** `team_names`/`competition_names` carry no `source_id`; `team_aliases.source_id` records which provider contributed a spelling. Provider primary keys are `external_ids` (P0-06) and nowhere else. **Ambiguous alias resolution must fail, never choose** — "Barcelona" and "Arsenal" each match several clubs (§10.3).
+- **Slugs are stable public identifiers.** Correct them freely before public exposure; afterwards a change needs a redirect mechanism, which is not built. Not enforced at the database level (§10.7).
+- **Partial unique indexes over exclusion constraints** for "exactly one current row" (§10.4). Unique indexes are **not deferrable**: close-then-open in two ordered statements, never one.
 - **A row in a `DEFAULT` partition is a failure, not a warning.** Once a row for a given month sits in `DEFAULT`, that month's partition can no longer be attached without detaching and relocating. `db:verify-partitions` asserts `DEFAULT` is empty (§9.5).
 - Every feature and training query needs an explicit `ORDER BY` — unordered rows change floating-point summation order and break reproducibility.

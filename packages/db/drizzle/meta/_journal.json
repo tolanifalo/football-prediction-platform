@@ -36,6 +36,20 @@
       "when": 1788824575543,
       "tag": "0004_p0_04_raw_payloads_partitioned",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1788853891462,
+      "tag": "0005_p0_05_canonical_entities",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1788853924910,
+      "tag": "0006_p0_05_canonical_grants",
+      "breakpoints": true
     }
   ]
 }

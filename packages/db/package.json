@@ -12,7 +12,8 @@
     "db:migrate": "node src/migrate.ts",
     "db:verify-generate": "node src/verify-generate.ts",
     "db:verify-harness": "node src/verify-harness.ts",
-    "db:verify-partitions": "node src/verify-partitions.ts"
+    "db:verify-partitions": "node src/verify-partitions.ts",
+    "db:verify-canonical": "node src/verify-canonical.ts"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",

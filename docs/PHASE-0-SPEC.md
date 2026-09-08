@@ -394,12 +394,12 @@ Proves: the entire chain — that the bitemporal history was not mutated, that n
 | **4** | **Replayed fixtures** | A replay from 0–0 is a **new fixture row** with `replaces_fixture_id`. Identity: `UNIQUE (season_id, stage, leg, replay_number, home_team_id, away_team_id)`. |
 | **5** | **Two-legged ties** | `stage` and `leg` are part of the identity key, so the same pair meeting twice in a season is legal. `tie_id` groups the legs and is where aggregate-score logic lives. `leg ∈ {1,2}`, `tie_id` non-null only for two-legged ties. |
 | **6** | **Renamed competitions** | `competition_names(competition_id, name, name_type ∈ {official, sponsored, short}, valid_from, valid_to)`. Canonical name is **sponsor-free**. Render the name valid at the fixture's `local_date`. `seasons.format` jsonb describes structure — **no code may assume a group stage exists.** |
-| **7** | **Renamed teams** | `team_names(team_id, name, name_type, valid_from, valid_to, source_id)`. **`teams` has no name column at all** — removing it makes the correct behaviour the only possible behaviour. Historical pages render the name valid at match date. |
+| **7** | **Renamed teams** | `team_names(team_id, name, name_type, valid_from, valid_to, source_id)`. — **[SUPERSEDED 2026-09-08]** `team_names` carries **no `source_id`**: a club's official name is display truth, not a provider's opinion. Provider spellings live in `team_aliases.source_id`; provider primary keys live in `external_ids` (P0-06). See **§10.3**. **`teams` has no name column at all** — removing it makes the correct behaviour the only possible behaviour. Historical pages render the name valid at match date. |
 | **8** | **Dissolved / recreated clubs** | `teams.status ∈ {active, dissolved, merged}`, `succeeded_by_team_id`, `continuity ∈ {legal, sporting, none}`. A phoenix club is a **new `team_id` by default**; asserting statistical continuity is an explicit, recorded, reversible decision. **Never delete a team row** — tombstone it. |
 | **9** | **Provider ID changes** | `external_ids` is bitemporal with `confidence` and `last_verified_at`. A nightly job re-checks the provider's current name for each mapped ID against our alias set; a mismatch drops confidence and files a review item. **Never auto-remap.** |
 | **10** | **Duplicate provider records** | Many external IDs → one internal ID is legal and expected. One external ID → two internal IDs is blocked by `UNIQUE (source_id, entity_type, external_id)` where `superseded_at IS NULL`. Cross-provider duplicates go to `fixture_match_candidates`, scored on (teams, ±3 days, competition), and are **never auto-merged when ambiguous**. |
 | **11** | **Timezones** | Store `kickoff_utc timestamptz` + `local_date date` + `local_tz` (IANA). **Reject any ingested datetime lacking an explicit UTC offset** — never infer one. `local_date` is computed and stored at ingest, not generated, because a competition's timezone can itself change. DST is handled automatically by storing instants; the hazard is providers sending wall-clock time, which the rejection rule catches. |
-| **12** | **Missing data** | `competition_coverage(competition_id, season_id, field, availability ∈ {always, partial, never}, verified_at)`. NULL means "not provided" and **no sentinel value is ever substituted**. Models declare `required_features`; a fixture whose coverage cannot satisfy them **receives no prediction rather than a silently degraded one**. |
+| **12** | **Missing data** | `competition_coverage(competition_id, season_id, field, availability ∈ {always, partial, never}, verified_at)`. — **[SUPERSEDED 2026-09-08]** the *rule* stands unchanged; the `competition_coverage` **table** is not built in P0-05 and has no replacement. It was never assigned to a task. Reassign to the provider/ingestion task that needs it. See **§10.9**. NULL means "not provided" and **no sentinel value is ever substituted**. Models declare `required_features`; a fixture whose coverage cannot satisfy them **receives no prediction rather than a silently degraded one**. |
 | **13** | **Late-arriving data** | `fixtures.stats_complete_at` is set when every field the coverage profile marks `always` is present. Rating jobs are **watermark-driven** — they process fixtures where `stats_complete_at > last_watermark`, never `date = yesterday`. Late data moves ratings forward and never retro-edits a published prediction. |
 | **14** | **Corrected data** | Bitemporal insert-and-supersede. `UPDATE` is forbidden on fact tables except to set `superseded_at`, enforced by **column-level GRANT**. Every correction re-settles affected outcomes as new rows and raises an alert naming the counts. |
 | **15** | **Odds price changes** | A tick is written **iff** `(price, is_available)` differs from the series' latest tick. `odds_coverage` records polling windows so that an absence of ticks is interpretable rather than ambiguous. |
@@ -664,6 +664,131 @@ Two schema decisions are made now because they are expensive to retrofit:
 
 ---
 
+# 10. Canonical entity layer (P0-05)
+
+Approved 2026-09-08 after a read-only design review. Claims marked **[VERIFIED]** were proved against drizzle-kit 0.31.10 / drizzle-orm 0.45.2 / PostgreSQL 17.6 in a disposable database; the repository was not modified by those experiments.
+
+Eight tables: `countries`, `venues`, `competitions`, `competition_names`, `seasons`, `teams`, `team_names`, `team_aliases`.
+
+## 10.1 Countries are football associations, not sovereign states
+
+England, Scotland, Wales and Northern Ireland have **no ISO 3166-1 alpha-2 code** — ISO gives them `GB`. All four are launch competitions. Gibraltar, the Faroe Islands, Curaçao, Hong Kong and Macau are FIFA members without sovereign status.
+
+Therefore `iso_alpha2` and `fifa_code` are both **nullable**, and neither is the identifier. Identity is a UUID key with a stable `slug`.
+
+**`competitions.country_id` is nullable** — the Champions League and the World Cup have no country. `confederation` classifies those instead.
+
+Countries remain **plain mutable** reference data (§2.1). Türkiye and North Macedonia renamed inside the data window, but a country name is cosmetic: it is no model input and it rewrites no fact.
+
+## 10.2 Competition, season, edition, stage
+
+| Concept | Lives on |
+|---|---|
+| Competition identity — the continuing entity | `competitions` |
+| Season **and** edition — one running of it | `seasons` (**the same thing; do not model both**) |
+| Stage, leg, replay | `fixtures` (P0-07), per §6 rule 5 |
+
+Stable attributes on the competition: `country_id`, `type`, `tier`, `confederation`, `gender`, `age_group`, `is_reserve_competition`, `slug`. Per-edition attributes on the season: dates, `format` jsonb, `is_current`, `label`.
+
+**`gender`, `age_group` and reserve classification appear on both `competitions` and `teams`, and are not decoration.** Without them the Women's Super League and the Premier League differ only by a name string, and a U21 or reserve side resolves onto its senior club — which §6 rule 8 forbids. `teams.parent_team_id` makes the reserve relationship explicit rather than inferred from a name suffix.
+
+Seasons: `UNIQUE (competition_id, label)`, dates as `date` (a season has no clock; fixtures do). Apertura and Clausura are two seasons of one competition with distinct labels and non-overlapping dates. **No season date-overlap constraint** — playoff tails and split-season boundaries would trip it for no benefit.
+
+## 10.3 Names, aliases, and the difference between them
+
+**`team_names` and `competition_names` are display truth. `team_aliases` are matching strings.** Resolution searches both; they are separate tables because one carries temporal meaning and the other does not.
+
+Valid intervals are **half-open `[valid_from, valid_to)`** — inclusive start, exclusive end, matching the `superseded_at > cutoff` convention in §2.2. `valid_to IS NULL` means current.
+
+Overlap is legitimate **across** `name_type` (a competition has an official name and a sponsored name at once) and forbidden **within** one. That is enforced by partial unique index, not by an exclusion constraint (§10.4).
+
+An alias must never silently merge two clubs. "Barcelona" matches FC Barcelona and Barcelona SC; "Arsenal" matches Arsenal FC, Arsenal Tula and Arsenal Sarandí. **Ambiguous resolution must fail rather than choose.** Alias strings therefore cannot be globally unique.
+
+`team_aliases.source_id` records **which provider contributed a spelling** and is nullable. This is not an external-ID table: aliases hold human-readable strings, `external_ids` holds opaque provider primary keys. `team_names` and `competition_names` carry **no `source_id`** — a club's official name is not a provider's opinion.
+
+`normalized_alias` is normalised **in application code**. `unaccent()` is not immutable and cannot back a generated column without wrapping it; avoid the extension entirely.
+
+## 10.4 Partial unique indexes, not exclusion constraints
+
+Forbidding overlapping history would need `EXCLUDE USING gist (... WITH &&)`, which requires the `btree_gist` extension and is not Drizzle-expressible. A partial unique index guarantees the case that actually matters — exactly one *current* row — with no extension and no raw SQL.
+
+**[VERIFIED]** all three patterns generate from `uniqueIndex(...).where(...)` and enforce correctly:
+
+```sql
+CREATE UNIQUE INDEX "team_names_current_idx"
+  ON "team_names" USING btree ("team_id","name_type") WHERE "valid_to" IS NULL;
+CREATE UNIQUE INDEX "competition_names_current_idx"
+  ON "competition_names" USING btree ("competition_id","name_type") WHERE "valid_to" IS NULL;
+CREATE UNIQUE INDEX "seasons_one_current_idx"
+  ON "seasons" USING btree ("competition_id") WHERE "is_current";
+```
+
+Proven against PostgreSQL 17.6: two historical rows for the same `(team, name_type)` are allowed; a historical row plus a current row is allowed; a **second current row is rejected**; and a current `official` name coexists with a current `common` name.
+
+**[VERIFIED] operational gotcha:** unique *indexes* are not deferrable, and **a single-statement current-season flip is order-dependent**. *(Corrected 2026-09-08 during P0-05 implementation: an earlier revision of this paragraph claimed such a flip always fails. It does not.)*
+
+It may raise —
+
+```
+ERROR: duplicate key value violates unique constraint "seasons_one_current_idx"
+```
+
+— if the replacement row is updated before the existing current row is cleared, or it may succeed, depending on update order. Both outcomes were reproduced on PostgreSQL 17.6 by varying only the physical row order; the index invariant (at most one current row) holds either way.
+
+**Therefore current-season handovers MUST use two ordered statements: first clear the existing current row, then set the replacement row current.** The same applies to closing and opening a name.
+
+That a one-shot flip can *succeed* is precisely why the rule is mandatory rather than advisory: it will pass in development and fail later on differently-ordered data.
+
+Consequence: **P0-05 needs no exclusion constraints, no extensions and no custom SQL for structure.** All eight tables are Drizzle-managed. The only raw SQL is the grants in §10.6.
+
+## 10.5 Identifier convention, with a recorded exception
+
+- **UUID** — `countries`, `competitions`, `seasons`, `teams`, `venues`. Registry entities, per §9.7.
+- **`bigint` identity** — `competition_names`, `team_names`, `team_aliases`. **A deliberate exception:** these are child detail rows, never foreign-key targets from other tables, and `team_aliases` is the hot lookup path during ingestion where a narrower key keeps the index tight.
+
+The UUID choice on the five registries is load-bearing rather than stylistic: `external_ids.internal_id` (P0-06) is a single polymorphic column, so every entity it can map must share one key type.
+
+## 10.6 Historical truth, and where an UPDATE rewrites it
+
+Mutable: all of `countries` and `venues`; `competitions.{tier, is_active}`; `teams.{status, crest_url, succeeded_by_team_id, continuity}`; `seasons.{format, is_current, end_date}`.
+
+Append-and-close: `team_names`, `competition_names`. Enforced by grant — the §9.3 pattern applied to valid-time:
+
+```sql
+GRANT SELECT, INSERT ON team_names, competition_names TO engine_rw;
+GRANT UPDATE (valid_to) ON team_names, competition_names TO engine_rw;
+```
+
+A name row can be **closed but never edited**. Rewriting `name` in place would silently relabel every historical page, with no error raised.
+
+Two hazards grants cannot cover: re-pointing `team_aliases.team_id` at a different club silently re-attributes all future ingestion, and deleting a team destroys history — **never delete a team; tombstone it** (§6 rule 8). The first belongs to the P0-06 review queue.
+
+## 10.7 Slugs are stable public identifiers
+
+Slugs on `countries`, `competitions`, `seasons`, `teams` and `venues` are the public URL identity.
+
+- They **may be corrected freely before public exposure.**
+- Once publicly exposed, changing a slug requires a redirect/alias mechanism, because external links and search indexes depend on it.
+- **No redirect mechanism is built now**, and slugs are **not** made immutable at the database level now. This is a recorded policy, not an enforced constraint.
+
+## 10.8 What P0-05 does not build
+
+- **No team↔competition participation table.** The set of teams in a season is `SELECT DISTINCT home_team_id, away_team_id FROM fixtures WHERE season_id = ?`. A separate table would be a second source of truth that can diverge from the fixtures it summarises. Participation is derived from `fixtures` (**P0-07**) and materialised by `standings` in Phase 1. Accepted limitation: a team with no fixtures yet is invisible — and before fixtures exist there is nothing to model.
+- **No `external_ids`, no `entity_review_queue`** — P0-06.
+- **No resolution or fuzzy-matching logic** — P0-12. P0-05 provides only the tables it will read.
+- **No provider IDs, columns or enum values** anywhere.
+- **No `competition_coverage`** (§10.9).
+- **No partitioning.** Every table is small: ~250 countries, ~1k teams and ~5k aliases at launch; ~50k teams and ~1M aliases at a global ceiling. All ordinary tables.
+- **No localisation.** No i18n requirement exists; `locale` columns would be speculative.
+
+## 10.9 `competition_coverage` is removed from scope
+
+`competition_coverage` is **not built in P0-05, and has no replacement table.** It appeared in §6 rule 12 and §B without ever being assigned to a task.
+
+The underlying rule stands and is unchanged: NULL means "not provided", no sentinel is substituted, and a fixture whose coverage cannot satisfy a model's required features **receives no prediction rather than a silently degraded one**. Only the mechanism is deferred. If coverage needs explicit modelling, it is assigned to the provider/ingestion task that needs it, at that time.
+
+---
+
 # A. Final architecture
 
 Unchanged from `ARCHITECTURE.md` in shape — three deployables, database as the engine↔app interface, one scoreline matrix deriving all markets. Four amendments:
@@ -677,7 +802,7 @@ Unchanged from `ARCHITECTURE.md` in shape — three deployables, database as the
 
 **Provenance** (§9) — `data_sources`, `job_runs` (absorbs `ingestion_runs`), `raw_payload_bodies` (unpartitioned, globally deduped on `hash_algo + body_hash`), `raw_payloads` (partitioned monthly by `fetched_at`, one row per fetch, no global dedup constraint), `v_raw_payload_seen`, `external_ids` (bitemporal).
 
-**Canonical** — `countries`, `competitions`, `competition_names`, `seasons` (with `format`), `teams` (**no name column**), `team_names`, `team_aliases`, `venues`, `competition_coverage`.
+**Canonical** (§10) — `countries`, `venues`, `competitions`, `competition_names`, `seasons` (with `format`), `teams` (**no name column**), `team_names`, `team_aliases`. *`competition_coverage` removed from scope 2026-09-08 — see §10.9.*
 
 **Fixtures** — `fixtures` (identity: `season_id, stage, leg, replay_number, home_team_id, away_team_id`; plus `tie_id`, `replaces_fixture_id`, `stats_complete_at`), `fixture_schedule` (bitemporal).
 
@@ -730,7 +855,7 @@ Phase 0 ends at P0-18, not P0-17. **The waiting period is part of the plan** —
 | P0-02 | Both a TS and a Python process connect and round-trip a query; `docker compose down -v && up` reproduces a clean DB |
 | P0-03 | Three proofs, none of which may use `tablesFilter` (§8.2): **(1)** a real Drizzle-managed table produces a migration, and repeated `drizzle-kit generate` runs on the unchanged schema produce an empty diff; **(2)** a `--custom` SQL migration applies successfully and is recorded in the same migration ledger; **(3)** a raw-SQL-owned table declared outside the Drizzle `schema` glob is fully typed and queryable but is **not emitted** by `generate`, and repeated generation stays clean. Plus `db:verify-generate` running in CI as a schema-input consistency check — **not** described or relied on as database drift detection (§8.3) |
 | P0-04 | Fetching the same body twice yields **one `raw_payload_bodies` row and two `raw_payloads` rows**, with `v_raw_payload_seen.seen_count = 2` (§9.3); 12 monthly partitions plus `DEFAULT` exist; a partition drop leaves other data intact; `engine_rw` is **refused** `UPDATE` and `DELETE` on both archive tables; deleting a referenced body is refused by `ON DELETE RESTRICT`; and **`db:verify-partitions` asserts all six invariants in §9.5** — including that `DEFAULT` is empty and that a routing probe reaches the current month's partition — failing loudly on any violation |
-| P0-05 | A team can be renamed and both the historical and the current name resolve correctly at their respective dates; `teams` has no name column |
+| P0-05 | Eight tables per §10, all Drizzle-managed, plus one custom grants migration. A team can be renamed and both the historical and the current name resolve correctly at their respective dates; `teams` has no name column. A **second current** `(team_id, name_type)` or a second current season per competition is **rejected by a partial unique index**, while two historical rows and a historical+current pair are accepted (§10.4). `engine_rw` is refused `UPDATE` on `team_names.name` and permitted `UPDATE (valid_to)` (§10.6). No participation table, no `external_ids`, no `competition_coverage` |
 | P0-06 | An external ID remapped to a different internal entity leaves the old mapping intact with `superseded_at` set; the as-of query returns the old mapping for a past cutoff |
 | P0-07 | Both legs of a two-legged tie insert without violating the unique constraint; a replay inserts as a new fixture linked by `replaces_fixture_id`; a reschedule creates a schedule revision, **not** a duplicate fixture |
 | P0-08 | **The §2.3 worked example passes as an automated test** — insert 2–1, insert the 2–2 correction, and assert the as-of query at T2 returns 2–1 while the current query returns 2–2. An `UPDATE` on a score column is **rejected by the database** for `engine_rw` |
