@@ -81,6 +81,7 @@ If the recomputed manifest hash does not match the stored one, something in the 
 | `match_stats` | **Full bitemporal** | xG and detailed stats are routinely revised days later |
 | `fixture_schedule` | **Full bitemporal** | Kickoff, venue and status change constantly |
 | `external_ids` | **Full bitemporal** | Providers merge and reuse IDs |
+| `odds_ticks` | **Full bitemporal, MANY current rows per series** | *(added 2026-09-08.)* An observation, not a mutable belief. `observed_at` is valid time, `known_at`/`superseded_at` transaction time, and several sources, price kinds and instants are legitimately current at once — unlike every other row in this table (**§14.4**) |
 | `team_names`, `competition_names` | Valid-time only | These change in the world; we rarely learn them *wrong* |
 | `countries`, `venues`, `bookmakers` | Plain mutable | Reference data. Versioning it buys nothing |
 | `predictions`, `team_ratings` | Append-only + `superseded_at` | Never corrected, only superseded by a newer computation |
@@ -244,19 +245,19 @@ Modelled separately from football data, sharing only `fixture_id`.
 
 ## 4.1 Structure
 
-**`bookmakers`** — `id, slug, name, kind ('bookmaker' | 'exchange' | 'aggregator'), country_scope, commission_rate` (exchanges only), `sharpness_tier`.
+**`bookmakers`** — `id, slug, name, kind ('bookmaker' | 'exchange' | 'aggregator'), country_scope, commission_rate` (exchanges only), `sharpness_tier`. — **[SUPERSEDED 2026-09-08]** `kind` has exactly **two** values, `bookmaker` and `exchange`. An **aggregator is a `data_source`**, not a bookmaker: it transmits other firms' prices, and `source_id` already records who supplied an observation while `bookmaker_id` records whose price it is (**§14.2**, G18). `commission_rate` is **permitted for exchanges and never required** — mandating it would substitute a value for "not provided", which §6 rule 12 forbids (G19).
 Exchanges are not bookmakers: their prices are net of commission and their liquidity is a signal in itself. The `kind` column keeps every downstream calculation honest about that.
 
 **`odds_series`** — the identity of a price series, stored **once**:
 `id, fixture_id, bookmaker_id, period ('ft'|'ht'|'2h'), market_type, line numeric NULL, selection`
-`UNIQUE (fixture_id, bookmaker_id, period, market_type, line, selection)`
+`UNIQUE (fixture_id, bookmaker_id, period, market_type, line, selection)` — **[SUPERSEDED 2026-09-08]** **this constraint does not work as written.** `line` is NULL for `1x2` and `btts`, and PostgreSQL treats NULLs as distinct — **proven:** two byte-identical 1X2 series were both accepted. The key must be declared **`NULLS NOT DISTINCT`** and gains `side`, with a companion CHECK requiring a line exactly for `over_under` and `asian_handicap` (**§14.3**, G2/G3).
 
 `period` was missing from the v1 schema and is not optional — half-time markets are a different market with the same `market_type` label.
 
 **`odds_ticks`** — append-only, **one row only when the price or availability changes**:
-`series_id, observed_at, price numeric, is_available boolean, source_id, raw_payload_body_id`
+`series_id, observed_at, price numeric, is_available boolean, source_id, raw_payload_body_id` — **[SUPERSEDED 2026-09-08]** the tick also carries **`known_at`** (CLAUDE.md #6 admits no exception, and §12.3's test applies: two providers can disagree about a price), **`superseded_at`**, **`provider_at`** (untrusted) and **`price_kind`**. It has **many simultaneously-current rows per series**, unlike every earlier fact table (**§14.4**, G10/G20).
 
-**`odds_coverage`** — `fixture_id, source_id, first_polled_at, last_polled_at, poll_count`.
+**`odds_coverage`** — `fixture_id, source_id, first_polled_at, last_polled_at, poll_count`. — **[SUPERSEDED 2026-09-08]** **not built, and neither is `odds_poll_windows`.** The concept is underspecified (coverage *of what* — a fixture, a competition, a request?) and `poll_count` is a mutable counter on immutable evidence, the defect §9.3 removed from `raw_payload_bodies`. **P0-10/P0-11 own polling semantics and therefore any coverage concept.** See **§14.9**.
 Without this, a gap in ticks is ambiguous between "price didn't move" and "we weren't looking". That distinction matters enormously when reconstructing a market.
 
 ## 4.2 Why this shape
@@ -278,7 +279,7 @@ Together this turns the ~15–20 GB/year projection from `DECISIONS-01` §6.1 in
 | `exchange_sp` | Betfair Starting Price — a real transacted settlement price | Betfair |
 | `last_observed_pre_kickoff` | **Our own last observation before kickoff. Not a closing price.** | Our polling |
 
-Stored on `odds_series` as `reference_price`, `reference_price_kind`, `reference_captured_at`.
+Stored on `odds_series` as `reference_price`, `reference_price_kind`, `reference_captured_at`. — **[SUPERSEDED 2026-09-08]** **no such columns exist.** They were mutable derived state on an immutable identity header, and `provider_closing`/`exchange_sp` are observations with their own provenance, which the series would orphan. `price_kind` lives on **`odds_ticks`**, and `last_observed_pre_kickoff` is **derived, never stored** (**§14.6**, G4/G5).
 
 Two rules:
 
@@ -402,7 +403,7 @@ Proves: the entire chain — that the bitemporal history was not mutated, that n
 | **12** | **Missing data** | `competition_coverage(competition_id, season_id, field, availability ∈ {always, partial, never}, verified_at)`. — **[SUPERSEDED 2026-09-08]** the *rule* stands unchanged; the `competition_coverage` **table** is not built in P0-05 and has no replacement. It was never assigned to a task. Reassign to the provider/ingestion task that needs it. See **§10.9**. NULL means "not provided" and **no sentinel value is ever substituted**. Models declare `required_features`; a fixture whose coverage cannot satisfy them **receives no prediction rather than a silently degraded one**. |
 | **13** | **Late-arriving data** | `fixtures.stats_complete_at` is set when every field the coverage profile marks `always` is present. Rating jobs are **watermark-driven** — they process fixtures where `stats_complete_at > last_watermark`, never `date = yesterday`. Late data moves ratings forward and never retro-edits a published prediction. |
 | **14** | **Corrected data** | Bitemporal insert-and-supersede. `UPDATE` is forbidden on fact tables except to set `superseded_at`, enforced by **column-level GRANT**. Every correction re-settles affected outcomes as new rows and raises an alert naming the counts. |
-| **15** | **Odds price changes** | A tick is written **iff** `(price, is_available)` differs from the series' latest tick. `odds_coverage` records polling windows so that an absence of ticks is interpretable rather than ambiguous. |
+| **15** | **Odds price changes** | A tick is written **iff** `(price, is_available)` differs from the series' latest tick. `odds_coverage` records polling windows so that an absence of ticks is interpretable rather than ambiguous. — **[SUPERSEDED 2026-09-08]** the change-only rule stands but is **ingestion behaviour, not a database constraint**: no constraint can compare a row against its predecessor, so P0-10/P0-11 enforce it and P0-14 asserts it. `odds_coverage` is **not built** (§14.9): an absence of ticks may mean the price held, that we were not polling, that the fixture was unmapped, or that the parse failed — and none of those is knowable from an empty result. |
 
 ---
 
@@ -465,7 +466,7 @@ Objects are split by *who owns their DDL*, and the split is physical:
 
 Declarations under `raw-sql/` are ordinary `pgTable` definitions. They remain **fully typed and queryable** through Drizzle — select, insert, joins, inferred row types — because typing is a property of the declaration, not of the config glob. They are simply invisible to `generate`. **[PROVEN]** — a partitioned table declared this way accepted an insert through Drizzle, routed correctly to its partition, and left `generate` reporting *"No schema changes"*.
 
-Objects that belong in `raw-sql/`: partitioned tables (`raw_payloads`, `odds_ticks`), materialised views (`standings`), and anything else whose DDL Drizzle cannot express.
+Objects that belong in `raw-sql/`: partitioned tables (`raw_payloads`, `odds_ticks`), materialised views (`standings`), and anything else whose DDL Drizzle cannot express. — **[SUPERSEDED 2026-09-08]** **`odds_ticks` is NOT partitioned and is Drizzle-managed.** Measured on 17.6: partitioning by `observed_at` made the dominant query — latest price for one series — cost **42 buffers against 1**, with **2,020 planning buffers against 36**, because `series_id` says nothing about which month a tick lives in. Revisit at ~20–30M rows or when retention is designed (**§14.10**, G12). The rule about which objects belong here is unchanged.
 
 **Withdrawn:** the earlier prescription — declare raw-SQL-owned tables in the generated schema and exclude them with `tablesFilter` — **does not work and must not be used.** **[PROVEN]** declaring a partitioned table in the `schema` glob makes `generate` emit a plain, *unpartitioned* `CREATE TABLE` for it, and adding `tablesFilter` produces byte-identical output.
 
@@ -588,6 +589,8 @@ v_raw_payload_seen(body_id, seen_count, first_seen_at, last_seen_at)
   = aggregate over raw_payloads grouped by body_id
 ```
 
+**A request that produced no response content produces no observation.** `raw_payloads.body_id` is `NOT NULL` (probed: `23502`), so a connection timeout — which said nothing — cannot be archived. That is correct rather than a gap: payloads are what the provider actually said. Attempts that failed without a response are counted in `job_runs.stats` (§15.5, §15.10).
+
 Consequently every column of `raw_payload_bodies` and `raw_payloads` is immutable once written. There is no `superseded_at` on either: **evidence is never corrected.** A provider issuing a correction sends new bytes, which are a new body and a new observation. Supersession belongs to derived facts, never to the archive — facts are beliefs and beliefs get revised; payloads are what the provider actually said.
 
 Enforced by grant, not convention: `engine_rw` receives `SELECT, INSERT` on both tables and **no `UPDATE` and no `DELETE` at all**. `job_runs` is the sole exception, receiving `UPDATE (status, finished_at, stats, error)` so a run can be closed.
@@ -646,6 +649,8 @@ This is a live PostgreSQL invariant check. It is not a variant of `db:verify-gen
 - **`bigint` identity** for append-only, log-style, high-volume records (`job_runs`, `raw_payload_bodies`, `raw_payloads`) — smaller, ordered, index-friendly.
 
 Either would work for either. The rule exists so the choice is not re-argued per table.
+
+**Redaction caveat [VERIFIED 2026-09-08]:** the `request_params` and `response_headers` CHECK constraints use `jsonb_exists_any`, which tests **top-level keys, case-sensitively**. Probed against the live schema, they **accept** a nested `{"query": {"api_key": ...}}`, a capitalised `X-Api-Key` and a capitalised `Authorization`. They remain valuable defence in depth, exactly as described above, but **the adapter boundary is the real guard** and owns recursive, case-insensitive scrubbing plus header lowercasing (§15.7).
 
 **Index caveat [VERIFIED]:** `CREATE INDEX CONCURRENTLY` cannot be used on a partitioned table (`ERROR: cannot create index on partitioned table concurrently`), and cannot run inside a transaction, which the migrator always uses. Plain `CREATE INDEX` on the parent inside a transaction works and cascades to partitions. Harmless while tables are empty; adding an index to a populated partitioned table later will need an out-of-band procedure, not a migration.
 
@@ -1406,6 +1411,396 @@ It is **meta-tested** by breaking several invariants at once and confirming a no
 
 ---
 
+# 14. Historical odds model (P0-09)
+
+Approved 2026-09-08 after a design review, a correction round, and seven disposable probes on PostgreSQL 17.6 / drizzle-kit 0.31.10. Twenty-one decisions (G1–G21) were ruled, four of them in the correction round.
+
+P0-09 establishes the **canonical market-observation layer** and nothing that interprets it. It stores what a firm offered, when, and who told us. Every probability, overround, fair price, edge, EV, Kelly figure and CLV number is derived later, in Phase 4 (§G, §4.4).
+
+**The dependency direction is one-way and unchanged:** football facts → prediction model → model probabilities → odds observations → value/edge/CLV. Nothing here is readable as a football feature, and no derived probability exists for one to leak through.
+
+**Dependencies are 04, 06 and 07** — `data_sources` and `raw_payload_bodies` for provenance, `fn_visible_at` for visibility, `fixtures` as the anchor. *(§D's task row read `04, 07` until corrected 2026-09-08.)*
+
+## 14.1 Scope
+
+**Owns:** `bookmakers`, `odds_series`, `odds_ticks`, `odds_ticks_as_of(cutoff)`, grants, and `db:verify-odds`.
+
+**Does not own:** odds ingestion, polling, adapters, HTTP, scrapers, schedulers (P0-10/11, and §G bans schedulers in Phase 0) · **odds coverage in any form** (§14.9) · fixture matching and `fixture_match_candidates` (P0-12) · `market_consensus`, `value_signals`, de-vigging, implied or fair probabilities, edge, EV, Kelly, CLV (Phase 4) · `predictions`, `team_ratings`, backtesting · `match_events`, `standings`, anything visible.
+
+## 14.2 Bookmaker identity — and why it is not provenance
+
+Four concepts are kept strictly apart, and two of them appear on every observation:
+
+| Concept | Where | Question it answers |
+|---|---|---|
+| **Data source / provider** | `data_sources` | **who supplied or transmitted the observation** |
+| **Bookmaker / exchange** | `bookmakers` | **whose market price the observation represents** |
+| Market | `odds_series` | which question, at which line, on which side |
+| Observation | `odds_ticks` | the price at an instant |
+
+**An aggregator is a `data_source` reporting a bookmaker's price. It is never a `bookmakers` row.** Oddschecker, The Odds API and a vendor feed all transmit other firms' prices; recording them as bookmakers would make the registry mean two different things at once. `bookmakers.kind` therefore has **exactly two values — `bookmaker` and `exchange`** *(G18)*. §4.1's third value, `aggregator`, is superseded.
+
+**Source and bookmaker are intentionally distinct identities and may describe the same commercial entity from two angles.** Bet365's own API is a `data_source`; Bet365 the firm is a `bookmaker`. That is not redundancy — it is what later lets us compare *"Bet365's price as Bet365 reported it"* against *"as an aggregator reported it"*, which is a real data-quality signal.
+
+**`commission_rate` is permitted for exchanges and never required** *(G19)*. An earlier draft made it mandatory; that was wrong. Betfair's rate varies by market and by account discount, and §6 rule 12 forbids substituting a value for "not provided". The rule is one-directional: only an exchange may carry a commission, it may be NULL, and it must lie in `[0, 1)`. A downstream EV calculation finding NULL must **refuse rather than assume 5%** — the same discipline that gives a fixture with unsatisfiable coverage no prediction rather than a degraded one.
+
+`bookmakers` is **plain mutable reference data** (§2.1), like countries and venues: a rename is cosmetic, is no model input, and rewrites no fact. This deliberately differs from P0-05's treatment of team names, on §2.1's authority.
+
+**Known limitation, recorded rather than absorbed:** tote and pari-mutuel pools are neither a bookmaker nor an exchange and are not representable. No Phase 0 or Phase 1 source supplies them, and a third `kind` is not invented on speculation. Two apparent gaps that are *not* gaps: an aggregator's "best price across books" and a vendor's "market average closing" are **derived aggregates**, which P0-09 does not store by design.
+
+**Bookmaker provider IDs are deferred** *(G16)*. §11.4's five entity types stand unamended; P0-11's source identifies bookmakers by CSV column prefix, so there is nothing to map.
+
+## 14.3 `odds_series` — market identity
+
+`(fixture_id, bookmaker_id, period, market_type, line, selection, side)`, stored once and referenced by every tick. That normalisation plus change-only ingestion is what turns §6.1's 15–20 GB/year projection into low single-digit GB, losslessly.
+
+### The business key needs `NULLS NOT DISTINCT`
+
+```sql
+UNIQUE NULLS NOT DISTINCT (fixture_id, bookmaker_id, period, market_type, line, selection, side)
+```
+
+**§4.1's constraint as written does not work.** `line` is NULL for `1x2` and `btts`, and PostgreSQL treats NULLs as distinct by default — so an ordinary `UNIQUE` accepts unlimited duplicate 1X2 series. **Proven:** two byte-identical 1X2 series were both **ACCEPTED** under default semantics and are **rejected `23505`** under `NULLS NOT DISTINCT`, which still permits 2.50 alongside 2.75.
+
+What makes the key sound is its companion CHECK: **a line is required exactly for `over_under` and `asian_handicap`, and forbidden for `1x2` and `btts`.**
+
+### Market taxonomy *(G7)*
+
+| `market_type` | `line` | `selection` |
+|---|---|---|
+| `1x2` | forbidden | `home` · `draw` · `away` |
+| `over_under` | required | `over` · `under` |
+| `btts` | forbidden | `yes` · `no` |
+| `asian_handicap` | required | `home` · `away` |
+
+This is the same `(market_type, line, selection)` triple `prediction_markets` uses (ARCHITECTURE §3.4) — deliberately, so model probability and market price join without translation.
+
+**The Asian-handicap line is always expressed from the HOME team's perspective** *(G8)*. "Home −0.5" and "Away +0.5" are the two selections of the single market `(asian_handicap, −0.5)`, never two markets. Without that rule one market has two encodings and overround grouping silently breaks.
+
+**Half-time markets use `period = 'ht'`**, never a separate `market_type`. `market_type` is CHECK-enumerated; `selection` is free text with a documented convention, because enumerating every selection would fix a vocabulary before its consumer exists (§11.2). **Deferred until a real consumer requires them:** double chance, draw-no-bet, European handicap, correct score, corners, cards, player props, in-play.
+
+### `side`, and why it is not CHECK-coupled to `kind`
+
+Exchange back and lay are **separate series** *(G3)*: a lay price is a different offer with its own price path, not a variant of the back price. `side` defaults to `back`, so sportsbooks are unaffected.
+
+A sportsbook lay price is invalid data — but **that must not be a CHECK** *(G21)*. Expressing it needs a subquery across tables, which PostgreSQL rejects outright (`0A000`), and the function-based workaround was proven **unsound** in P0-08: it passes at write time and is silently invalidated when the referenced row changes. It is a `db:verify-odds` assertion and a P0-14 data-quality rule. Later tasks must know that a sportsbook lay series is bad data, not a modelling choice.
+
+### Immutable after insert *(G14)*
+
+**No role holds `UPDATE` on any column.** Repointing `fixture_id` would silently re-attribute an entire price history to a different match — the hazard §10.6 names for `team_aliases.team_id`. A mis-mapping is corrected by superseding the wrong series' ticks and inserting under the right series; the empty series row is harmless.
+
+## 14.4 `odds_ticks` — observations
+
+### Its temporal cardinality is deliberately unlike every earlier fact table
+
+P0-06, P0-07 and P0-08 each have **exactly one** current row per business key. `odds_ticks` has **many simultaneously-current rows per series**, on purpose *(G10)*:
+
+- several sources may report the same bookmaker's price;
+- several price kinds coexist — an `observed` tick and a `provider_closing` at the same instant;
+- observations at different instants are the entire point of a price path.
+
+**Only the exact `(series_id, source_id, observed_at, price_kind)` current duplicate is forbidden.** A reviewer carrying the one-current-row pattern forward from the earlier tables will misread this table, which is why it is stated here rather than left to be inferred.
+
+### Four timestamps, none collapsible *(G20)*
+
+| Column | Axis | Definition |
+|---|---|---|
+| `observed_at` | valid | The **substantiated observation-time convention**. It asserts *"this price was on offer at this instant"* and asserts **nothing** about when it started being on offer. |
+| `provider_at` | valid, nullable | The provider's own timestamp. **Explicitly untrusted** — kept for forensics, never used for ordering or cutoffs. |
+| `known_at` | transaction start | When the observation entered our database. |
+| `superseded_at` | transaction end | When our belief about the observation was superseded. NULL = current. |
+
+> **Polling tells us when we looked. It does not tell us when the bookmaker changed a price.** A price seen at 14:00 may have been posted at 13:58 or at 09:00; our cadence cannot distinguish them. Any claim that `observed_at` marks a price *change* is unsupportable.
+
+### `price_kind` is also the interpretation key for `observed_at`
+
+| `price_kind` | What `observed_at` means |
+|---|---|
+| `observed` | A **real poll instant.** We were looking, and this price was on offer then. |
+| `provider_opening` · `provider_closing` | A **convention.** The source supplies a price with no substantiated instant, so the adapter must document the convention it applies and apply it consistently. |
+| `exchange_sp` | A **defined settlement instant** — BSP is struck at the off. |
+
+**A reproducibility read must therefore filter `price_kind = 'observed'`.** A `provider_closing` tick's `observed_at` is a convention we invented; letting it into a point-in-time snapshot would offer a price nobody could have taken.
+
+### Prices, suspension and append-only
+
+Decimal only, `numeric(9,4)`, **exact — never float**: §5.2 names floating-point reduction order as a determinism hazard. Structural range `1.01 … 100000`; the 1.01–1000 rule of `ARCHITECTURE` §7 remains a P0-14 quality assertion, since exchange lay prices legitimately exceed 1000. *(Note: `numeric(9,4)` tops out at 99999.9999, so an over-range price is refused by the type as `22003` before the CHECK can see it. Both are valid rejection paths — §11.3's principle that SQLSTATEs are implementation detail and the invariant is that the row cannot be written.)*
+
+**A suspended market is `is_available = false` with `price IS NULL`**, enforced by CHECK. §6.13(b): absence is not "no change", and without the flag a reconstruction interpolates straight through suspensions — which cluster at exactly the informative moments.
+
+**Append-only.** A mis-parse is retracted by setting `superseded_at`, never deleted, so a cutoff before the retraction still sees what we believed then.
+
+## 14.5 The cutoff query
+
+`odds_ticks_as_of(cutoff)` is the **fifth** wrapper. It delegates to `fn_visible_at` and never restates the predicate; the P0-06 catalog assertion must still find exactly one object defining the visibility comparison.
+
+**The wrapper bounds transaction time only.** A reproducibility read must add the other two bounds itself:
+
+```sql
+SELECT DISTINCT ON (t.series_id) t.series_id, t.price, t.observed_at
+  FROM odds_ticks_as_of(:T) t              -- what we KNEW by T
+  JOIN odds_series s ON s.id = t.series_id
+ WHERE s.fixture_id = :f
+   AND t.observed_at <= :T                 -- what the market had DONE by T
+   AND t.price_kind  = 'observed'          -- substantiated instants only
+ ORDER BY t.series_id, t.observed_at DESC;
+```
+
+All three filters are load-bearing and each omission is a different class of leak. `provider_at` is never used for cutoffs.
+
+## 14.6 Closing semantics
+
+**No `reference_price`, `reference_price_kind`, `reference_captured_at`, `closing_odds` or `last_observed_pre_kickoff` column exists** *(G4, G5)*. §4.3's placement of those on `odds_series` is superseded: they were mutable derived state on an immutable identity header — the defect §9.3 removed from `raw_payload_bodies` — and `provider_closing` and `exchange_sp` are *observations with their own provenance*, which putting them on the series would orphan.
+
+- **`provider_closing`** — the source's own declared closing price. A true closing line.
+- **`exchange_sp`** — a real transacted settlement price. The most honest closing reference available.
+- **`last_observed_pre_kickoff`** — **derived, never stored**: `MAX(observed_at)` over `price_kind = 'observed'`, bounded by the `fixture_schedule` revision where `status` became `live` (§4.3: triggered by the status transition, not the scheduled time).
+
+**Our last observation is not a closing price.** CLV against `provider_closing` or `exchange_sp` is true CLV; against `last_observed_pre_kickoff` it is an **approximation whose error is our polling cadence**, and §4.3's rule that this must be labelled an approximation everywhere follows directly from what `observed_at` can substantiate. **P0-09 calculates no CLV.**
+
+## 14.7 Deduplication — four layers, four owners
+
+| Concern | Owner | Mechanism |
+|---|---|---|
+| Identical response bodies | P0-04 | global `UNIQUE (hash_algo, body_hash)` |
+| Same price re-polled | **ingestion, P0-10/11** | §6 rule 15's change-only rule — **not expressible as a constraint** |
+| Two current rows claiming one instant | **P0-09** | `UNIQUE (series_id, source_id, observed_at, price_kind) WHERE superseded_at IS NULL` |
+| Two providers disagreeing | query / **P0-14** | `source_id` in the key; both are kept |
+
+**Uniqueness is never keyed on price.** Two identical prices at different instants are two legitimate observations and both survive — keying on price would destroy real history, which is the P0-04 lesson.
+
+## 14.8 Permissions
+
+```sql
+GRANT SELECT, INSERT, UPDATE ON bookmakers  TO engine_rw;   -- plain mutable (§2.1)
+GRANT SELECT, INSERT ON odds_series TO engine_rw;           -- immutable after insert
+GRANT SELECT, INSERT ON odds_ticks  TO engine_rw;
+GRANT UPDATE (superseded_at) ON odds_ticks TO engine_rw;
+GRANT SELECT ON bookmakers, odds_series, odds_ticks TO app_rw, analytics_ro;
+```
+
+No `DELETE` and no `TRUNCATE` to any role, on any of the three tables. The engine may record an observation and retract a mis-parse; it may not rewrite a price, an availability flag, a `price_kind`, any timestamp, or any provenance column.
+
+## 14.9 `odds_coverage` is deferred entirely *(G13)*
+
+**P0-09 creates neither `odds_coverage` nor `odds_poll_windows`.**
+
+- **P0-09 does not own odds coverage.**
+- **P0-10 / P0-11 own polling and ingestion semantics**, and therefore own any coverage concept.
+- **Future coverage may be derived or modelled** once the polling and adapter requirements are known.
+- **Absence of a canonical tick must not be interpreted as proof that the market was unavailable.** It may mean the price did not move, that we were not polling, that the fixture was unmapped, or that the parse failed. Those are four different things and none is knowable from an empty result.
+- **No coverage table is created merely to satisfy an ambiguous historical requirement.**
+
+§4.1's `odds_coverage` had two defects: the concept is underspecified — coverage *of what*, a fixture, a competition, a request? — and its `poll_count` is a mutable counter on immutable evidence, the exact defect §9.3 removed from `raw_payload_bodies`. §E's P0-09 acceptance criterion is superseded accordingly, and `db:verify-odds` asserts **nothing** resembling coverage, so the deferral cannot be quietly undone by a test.
+
+## 14.10 Storage, partitioning, indexes
+
+| Horizon | Volume | Size |
+|---|---|---|
+| Phase 0 (P0-13) | ~308k series, ~616k ticks | ≈ 230 MB |
+| Phase 1 forward capture | 6–23M ticks/year | ≈ 2–6 GB/year |
+
+Measured: 300,000 ticks with two indexes occupy 63 MB — **210 bytes per tick**.
+
+**`odds_ticks` is NOT partitioned** *(G12)*, and §8.1's listing of it among partitioned raw-SQL-owned tables is superseded. Measured, partitioning by `observed_at`:
+
+| Query | Partitioned | Flat |
+|---|---|---|
+| Latest price for one series | **42 buffers** | **1** |
+| Full price path | 30 | 13 |
+| Reproducibility at cutoff | 399 | 396 |
+| *Planning alone* | **2,020 buffers** | 36 |
+
+Every series-scoped query fans out across all partitions, because `series_id` says nothing about which month a tick lives in; pruning helps only time-bounded scans. **Threshold for revisiting:** when retention is implemented, or at roughly 20–30M ticks — and note then that partitioning by `observed_at` requires every series-scoped query to carry a time bound.
+
+```
+odds_series  UNIQUE NULLS NOT DISTINCT (…7 columns…)
+             (fixture_id)
+             (fixture_id, period, market_type, line, selection)   -- cross-bookmaker
+odds_ticks   UNIQUE (series_id, source_id, observed_at, price_kind) WHERE superseded_at IS NULL
+             (series_id, observed_at DESC)                        -- latest, path, closing, cutoff
+```
+
+**No `known_at` index**, following §12.8 and §13.7: no probed query used one.
+
+## 14.11 The de-vigging boundary
+
+P0-09 stores **raw market prices only**. No `implied_probability`, `overround`, `fair_probability`, `consensus_probability`, `edge`, `ev`, `kelly` or `clv` column exists on any odds table, and `db:verify-odds` asserts their absence by name.
+
+Every calculation in §4.4 is derived at analysis time in Phase 4, and §4.4's own instruction governs: *"Store raw prices only… Baking one in now is a decision you cannot revisit."*
+
+## 14.12 Migration and verification
+
+**Generated:** `0014_p0_09_odds_model.sql` — three tables, 5 FKs, 4 indexes, 12 CHECKs. Drizzle 0.45.2 expresses all of it, `UNIQUE NULLS NOT DISTINCT` included.
+
+**`--custom`:** `0015_p0_09_asof_grants.sql` — the wrapper and the grants. **No triggers on any odds table.**
+
+**`db:verify-odds` asserts 110 invariants**, including: the duplicate-1X2 rejection that motivated `NULLS NOT DISTINCT`; line-required and line-forbidden behaviour; `aggregator` rejected and an exchange with a NULL commission accepted while a sportsbook with one is refused; many simultaneously-current ticks per series; identical prices at different instants both retained; the exact-duplicate rejection; supersession with the retracted row surviving; `observed_at` demonstrably a separate bound from `known_at`; `provider_at` retained without displacing `observed_at`; all four price kinds coexisting; `last_observed_pre_kickoff` derivable and *different* from the provider's closing price; that no role holds `UPDATE` on `odds_series`; index usage by `EXPLAIN`; that no derived-probability or coverage-shaped column exists; and that no P0-10+ table exists.
+
+It is **meta-tested** by breaking six invariants at once and confirming a non-zero exit, with every expected-failure probe `SAVEPOINT`-isolated.
+
+---
+
+# 15. Provider ingestion foundation (P0-10)
+
+Approved 2026-09-08 after a design/readiness pass and four probe groups against the live 16-migration schema. P0-10 is **application-layer code only**: it adds no table, no column and no migration, because P0-04 through P0-09 already carry everything ingestion needs.
+
+**P0-10 implements no provider.** That is P0-11.
+
+## 15.1 The boundary
+
+```
+provider → HttpTransport → ProviderAdapter → RawArchive
+        → canonical DTOs → identity resolution → repositories → Postgres
+```
+
+Three rules make it real, and each is asserted by a test:
+
+1. **An adapter imports no database code.** Not psycopg, not a schema module, not a repository — verified by parsing the AST of every `engine.ingestion` module, so a docstring may mention psycopg while an `import` may not.
+2. **Provider shapes never escape.** A `FetchResult` carries canonical DTOs only.
+3. **Evidence is archived before parsing**, through a port rather than a connection.
+
+## 15.2 The adapter contract
+
+```python
+class ProviderAdapter(Protocol):
+    provider_slug: str      # matches data_sources.slug
+    adapter_version: str    # written to job_runs.adapter_version
+    def capabilities(self) -> Capabilities: ...
+    def fetch(self, request: FetchRequest) -> FetchResult: ...
+```
+
+**One `fetch` method, not five.** `ARCHITECTURE.md` §4A originally specified `list_competitions()`, `list_fixtures()` and three siblings, each returning a bare list. That shape cannot express pagination state, partial failure, rate-limit state or the raw-payload linkage, so it forced every adapter either to write to the database itself — coupling provider parsing to Postgres — or to drop the evidence. A single method with a `domain` discriminator expresses those concerns once. §4A's underlying rules are unchanged and are exactly what this shape protects.
+
+```python
+FetchRequest(domain, scope, cursor)
+FetchResult(records, provenance, next_cursor, complete, problems)
+```
+
+**`next_cursor` and `complete` are separate, and that is load-bearing:**
+
+| `next_cursor` | `complete` | Meaning |
+|---|---|---|
+| `None` | `True` | finished; nothing more to fetch |
+| `"abc"` | `True` | more pages follow |
+| **`None`** | **`False`** | **we stopped and did not finish** |
+
+The third state is why a rate limit or an exhausted retry budget can never be mistaken for a completed sync. **A failed page can never produce `ok`.**
+
+## 15.3 Canonical DTOs
+
+Pydantic v2, used **here and only here**, to validate untrusted provider data at the boundary. It is not an ORM and not the persistence model; canonical writes remain explicit psycopg SQL in later phases. Models are `strict`, `frozen` and `extra="forbid"`, so a provider sending `"3"` where an integer belongs **fails rather than being coerced**.
+
+Six DTOs — the smallest set with a real producer and consumer: `CanonicalCompetition`, `CanonicalSeason`, `CanonicalTeam`, `CanonicalFixture`, `CanonicalResult`, `CanonicalOdds`. **`CanonicalVenue` and `CanonicalMatchStats` are deferred**: P0-11's source supplies neither.
+
+**Provider IDs are not canonical IDs.** Every reference carries `provider_key` — identity *input* for the resolver, destined for `external_ids` and nowhere else. **No field is named `id`**, so a repository cannot mistake a provider string for a canonical UUID.
+
+Every rule the validators enforce traces to an existing constraint; none is invented:
+
+- a datetime without an explicit UTC offset is **rejected, never inferred** (§6 rule 11);
+- `local_date` must agree with `kickoff_utc` in `local_tz`, and the zone must be a real IANA name (§12.4);
+- home and away must differ; `leg ∈ {1,2}`; `replay_number ≥ 0` (§12.2);
+- `ht ≤ ft`; `aet ≥ ft` because extra time is **cumulative**; a shootout requires extra time and cannot end level; an **awarded result is never trainable** (§13.2, §6 rule 3);
+- a line is required exactly for `over_under` and `asian_handicap` and forbidden otherwise; a suspended market carries no price; `1.01 ≤ price ≤ 100000`; only an exchange offers `lay`; a commission belongs only to an exchange and is never required (§14.3, G19);
+- a non-`observed` `price_kind` **must declare an `observed_at_convention`** — those kinds carry no substantiated instant (§14.4, G20).
+
+## 15.4 HTTP transport
+
+`HttpTransport` is a Protocol; `HttpxTransport` is the implementation. **Synchronous on purpose** — Phase 0 invokes jobs by hand and has no scheduler, so async would add concurrency complexity for scalability nothing needs. Testable end to end with `httpx.MockTransport`.
+
+Retries, backoff, timeouts and credential injection live **here, once**. An adapter that had to implement its own retry loop is a loop every future provider would re-implement wrongly.
+
+- **All four timeouts explicit** — connect, read, write, pool. A default of `None` is how an ingest job hangs.
+- **Bounded exponential backoff with jitter**; `Retry-After` always wins and is capped.
+- **A permanent failure still returns its bytes**, because those bytes are evidence.
+
+## 15.5 The raw archive port
+
+`RawArchive` abstracts `raw_payload_bodies` + `raw_payloads` + the `job_run_id` linkage. Adapters depend on the Protocol; tests use `InMemoryRawArchive`, which reproduces the real semantics:
+
+- **bodies deduplicate** on content, exactly as `UNIQUE (hash_algo, body_hash)` does;
+- **observations never deduplicate** — a re-fetch is a new row and **a retry is a new observation**, never a mutation of history;
+- `body_hash` is SHA-256 over the **exact decompressed response bytes**, before any parsing, and JSON is never canonicalised first (§9.4).
+
+**Evidence is committed in its own step, before parsing.** Raw evidence must never disappear because downstream parsing failed — a malformed payload stays inspectable, and a test proves it.
+
+*(A timeout produces no response content and therefore no `raw_payloads` row: `body_id` is `NOT NULL`, probed. Failed-without-response attempts are counted in `job_runs.stats` or they are invisible.)*
+
+## 15.6 Error taxonomy
+
+Eleven kinds — `AUTHENTICATION`, `AUTHORIZATION`, `RATE_LIMIT`, `TIMEOUT`, `NETWORK`, `PROVIDER_SERVER`, `NOT_FOUND`, `MALFORMED_PAYLOAD`, `SCHEMA_VALIDATION`, `IDENTITY_AMBIGUOUS`, `UNSUPPORTED_FEATURE` — with **retryability declared once, on the kind**, so no caller has to remember that a 401 must not be retried while a 429 must.
+
+Transient: rate limit, timeout, network, 5xx. Everything else is permanent. Authentication and authorisation are deliberately excluded: retrying a bad key burns quota and can earn a ban.
+
+**Problems are carried, not raised.** A page of fifty fixtures where three fail validation yields forty-seven records and three problems; raising would discard the forty-seven. `IngestionError` exists only for a run that cannot continue at all.
+
+## 15.7 Secrets
+
+**Credentials live in the environment, are injected by the transport, and never appear** in a DTO, a `FetchResult`, `request_params`, a `request_signature`, a log line or a persisted header. The adapter never sees one and therefore cannot leak one. `data_sources` holds no credentials (§9.1).
+
+**The database guard is shallower than it looks, which is why this module exists.** Probed against the live schema, `raw_payloads`' CHECK constraints — `jsonb_exists_any`, top-level keys, case-sensitive — **accept** all of these:
+
+| Case | Database |
+|---|---|
+| `{"query": {"api_key": "SECRET"}}` nested | **accepted** |
+| header `X-Api-Key` capitalised | **accepted** |
+| header `Authorization` capitalised | **accepted** |
+
+HTTP header names are case-insensitive by RFC 9110 and most clients preserve the server's casing, so the whitelist would miss real credentials in practice. This is not a P0-04 defect — §9.7 always described those CHECKs as defence in depth — but **P0-10 owns the real guard**:
+
+- **recursive** scrubbing through nested mappings and sequences, never mutating the caller's structure;
+- key matching that is **case- and separator-insensitive** (`X-Api-Key`, `API KEY`, `api_key` all match);
+- response header names **lowercased**, then filtered through a **positive whitelist** — an unrecognised header is dropped, not kept.
+
+Scope, stated so it is not mistaken for more: **we scrub keys, not free text.** A credential pasted into a value such as `{"note": "key=SECRET"}` is not detected, and pretending otherwise would give false confidence.
+
+**Request signature** = SHA-256 over the canonical endpoint plus its **non-credential** parameters, sorted. Credentials are *removed*, not redacted, so two developers with different keys sign the same logical request identically.
+
+## 15.8 The identity boundary
+
+P0-10 **defines the interface and implements none of it**. Three outcomes:
+
+```python
+Resolved(entity_kind, internal_id) | Ambiguous(entity_kind, candidates) | Unknown(entity_kind)
+```
+
+`Ambiguous` and `Unknown` carry **no `internal_id` field at all**, so a caller cannot accidentally read an identity out of them. *"Ambiguous resolution must fail rather than choose"* (§10.3); *"Never auto-remap"* (§6 rule 9). `EntityKind` is exactly the five `external_ids` types — **`fixture` is absent, and §11.4 stands unamended**.
+
+Matching, fuzzy scoring, `confidence` semantics and `fixture_match_candidates` are **P0-12**.
+
+## 15.9 Job and run semantics
+
+**One `job_runs` row = one invocation of one ingest job against one source** (§9.2). Not one HTTP request, not one fixture. Multiple requests and pages share the run's `job_run_id`; each is its own `raw_payloads` observation — probed, three pages produced three observations under one run.
+
+The schema already carries everything needed: `params`, `stats`, `error`, `adapter_version`, `attempt`, a `UNIQUE (job_name, scope_key, run_date, attempt)` key, and a `status` domain that **already includes `partial`**.
+
+- **Concurrency needs no lock.** A duplicate concurrent run is rejected `23505` by that unique key — probed. `attempt = 2` is the correct way to re-run.
+- **Completion:** `ok` only when every domain completed *and* nothing was rejected; `partial` when some work succeeded and some did not; `failed` when nothing usable was produced.
+
+## 15.10 Observability
+
+**No new table.** Counters serialise into `job_runs.stats` jsonb, already writable by `engine_rw`. Requests, retries, timeouts, bytes, per-status counts, latency p50/max, pages, failed pages, rows parsed/accepted/rejected, and identity resolved/ambiguous/unknown.
+
+Everything else is structured stdout logging. **No metrics backend, no dashboard, no monitoring stack** — §G bans it and nothing consumes it yet. Per-request status and latency are already reconstructible from `raw_payloads`.
+
+## 15.11 Write ownership
+
+**Adapters write nothing.** They return DTOs and call `RawArchive`. `CanonicalWriter` and `JobRunStore` are Protocols defined here and implemented in P0-11 as **explicit psycopg SQL, not an ORM** — Drizzle owns the schema and Python never migrates.
+
+| Table group | Written by |
+|---|---|
+| `data_sources`, `job_runs`, `raw_payload_bodies`, `raw_payloads` | `RawArchive` / `JobRunStore` |
+| `external_ids`, `entity_review_queue` | identity resolution (P0-12) |
+| canonical entities, fixtures, facts, odds | `CanonicalWriter` (P0-11) |
+
+## 15.12 Dependencies and testing
+
+Two runtime dependencies added and no others: **`httpx`** and **`pydantic`**. No ORM, no SQLModel, no FastAPI, no Redis, no Kafka, no message bus, no observability framework.
+
+**No test makes a live provider call.** `httpx.MockTransport` supplies every response; `InMemoryRawArchive` supplies persistence. The **adapter contract suite** is P0-10's deliverable and, per §E, is proven to *reject* a stub adapter that leaks a provider shape, omits `known_at`, or fails to archive its payload — each has a deliberately broken stub and a test asserting the suite catches it. A contract suite that has never rejected anything is not evidence of anything.
+
+---
+
 # A. Final architecture
 
 Unchanged from `ARCHITECTURE.md` in shape — three deployables, database as the engine↔app interface, one scoreline matrix deriving all markets. Four amendments:
@@ -1425,7 +1820,7 @@ Unchanged from `ARCHITECTURE.md` in shape — three deployables, database as the
 
 **Facts** — `match_results` (bitemporal, `is_trainable`, `result_source`, `occurred_at`), `match_stats` (bitemporal, **one row per (fixture, source, revision) with home/away paired columns — no `team_id`, no `is_home`, no `xga`**), `match_events` (deferred to Phase 8, schema reserved). *Both fully specified in **§13** (P0-08); the current-row business key is `(fixture_id, source_id)`, not `(fixture_id)`.*
 
-**Odds** — `bookmakers`, `odds_series` (with `reference_price`, `reference_price_kind`), `odds_ticks`, `odds_coverage`.
+**Odds** — `bookmakers` (`kind` is `bookmaker` or `exchange`), `odds_series` (business key **`NULLS NOT DISTINCT`**, plus `side`), `odds_ticks` (with `price_kind`, `observed_at`, `provider_at`, `known_at`, `superseded_at`). *No `reference_price*`; no `odds_coverage`. Fully specified in **§14** (P0-09).*
 
 **Model** — `model_versions`, `training_runs`, `dataset_snapshots`, `feature_snapshots`, `feature_snapshot_inputs` (sampled), `predictions`, `prediction_markets`, `team_ratings`.
 
@@ -1451,8 +1846,8 @@ Championship 2023/24 · consensus ground truth with manual adjudication of disag
 | **P0-06** | Per §11: the reusable **as-of mechanism** (§11.1), `external_ids` (bitemporal, polymorphic `internal_id` with trigger-enforced integrity), `entity_review_queue` (minimal, generic), grants | 04, 05 |
 | **P0-07** | Fixture identity: `fixtures` + `fixture_schedule` (bitemporal), ties, legs, replays | 04, 05, 06 — *[CORRECTED 2026-09-08]* this row previously read `05` alone. `fixture_schedule` carries `source_id` and `raw_payload_body_id` (P0-04) and is read through `fn_visible_at` (P0-06). See §12.1 |
 | **P0-08** | Bitemporal facts: `match_results`, `match_stats`, and **column-level grants**. **Consumes** the as-of mechanism built in P0-06 — *[CORRECTED 2026-09-08]* this row previously claimed ownership of the `as_of` SQL function; see §11.1 | 04, 06, 07 — *[CORRECTED 2026-09-08]* previously `04, 07`, which omitted `fn_visible_at`; see §13.1 |
-| **P0-09** | Odds model: `bookmakers`, `odds_series`, `odds_ticks`, `odds_coverage` | 04, 07 |
-| **P0-10** | `ProviderAdapter` interface + canonical DTOs + an adapter contract test suite any adapter must pass | 04 |
+| **P0-09** | Odds model: `bookmakers`, `odds_series`, `odds_ticks` — *`odds_coverage` deferred (§14.9)* | 04, 06, 07 — *[CORRECTED 2026-09-08]* previously `04, 07`, which omitted `fn_visible_at` |
+| **P0-10** | `ProviderAdapter` interface + canonical DTOs + an adapter contract test suite any adapter must pass — *implemented as **application-layer Python only**: no table, no column, no migration (§15)* | 04 — *its DTOs also mirror the canonical shapes of 05, 07, 08 and 09, though it writes none of them* |
 | **P0-11** | Adapter #1 — football-data.co.uk CSV (results **and** odds; free, no key, exercises the whole pipeline) | 10 |
 | **P0-12** | Entity resolution: alias matching, fuzzy candidates, **`fixture_match_candidates`** (§11.6), review queue population, and the semantics of `confidence` (§11.5) | 06, 11 |
 | **P0-13** | Historical import: 3 leagues × 5 seasons of results and odds, with full provenance | 08, 09, 12 |
@@ -1476,8 +1871,8 @@ Phase 0 ends at P0-18, not P0-17. **The waiting period is part of the plan** —
 | P0-06 | **As-of mechanism (§11.1):** every as-of read goes through `fn_visible_at` or a `<table>_as_of` wrapper — no caller, including the verification script, restates the predicate; a **CI catalog assertion proves exactly one object contains the predicate logic**; the wrapper is callable from **both TypeScript and Python**; and a selective filter through the wrapper still yields an **index scan**, not a function scan. **Bitemporal behaviour:** an external ID remapped to a different internal entity leaves the old mapping intact with `superseded_at` set, and the as-of query returns the old mapping for a past cutoff. **Uniqueness:** many external IDs may map to one internal ID; one external ID mapping to two current internal IDs is rejected by the partial unique. **Integrity (§11.3):** the mapping-side trigger validates `internal_id` against the registry named by `entity_type` **using `SELECT … FOR KEY SHARE`**, rejects mutation of `internal_id`/`entity_type`, and permits `superseded_at`/`confidence`/`last_verified_at`; the canonical-side trigger **blocks deletion of a referenced entity even where `engine_rw` holds `DELETE`**; trigger failures are **transaction-safe under `ROLLBACK TO SAVEPOINT`**; and **no application role holds `TRUNCATE`** on the canonical tables or `external_ids`. `entity_review_queue` exists and is empty — P0-06 writes no review items |
 | P0-07 | Both legs of a two-legged tie insert without violating the unique constraint; a replay inserts as a new fixture linked by `replaces_fixture_id`; a reschedule creates a schedule revision, **not** a duplicate fixture |
 | P0-08 | **The §2.3 worked example passes as an automated test** — insert 2–1, insert the 2–2 correction, and assert the as-of query at T2 returns 2–1 while the current query returns 2–2. An `UPDATE` on a score column is **rejected by the database** for `engine_rw` |
-| P0-09 | Polling an unchanged price twice writes **one** tick; a suspension writes a tick with `is_available = false`; `odds_coverage` distinguishes "not polled" from "unchanged" |
-| P0-10 | The contract test suite runs against a stub adapter and fails it for each of: provider shape leakage, missing `known_at`, absent raw payload persistence |
+| P0-09 | Polling an unchanged price twice writes **one** tick; a suspension writes a tick with `is_available = false`; `odds_coverage` distinguishes "not polled" from "unchanged" — **[SUPERSEDED 2026-09-08]** the first clause is **ingestion behaviour** and belongs to P0-10/P0-11 (§6 rule 15); the third depends on `odds_coverage`, which is **not built** (§14.9). **Amended criterion:** the odds layer accepts a suspension as `is_available = false` with `price IS NULL`; a duplicate 1X2 series is rejected by a `NULLS NOT DISTINCT` key; two identical prices at different instants both survive while an exact `(series, source, instant, kind)` current duplicate is rejected; a cutoff read distinguishes `known_at` from `observed_at`; `provider_closing`, `exchange_sp` and `observed` remain distinguishable and `last_observed_pre_kickoff` is derivable rather than stored; and **no derived probability, overround, fair price or coverage column exists** |
+| P0-10 | The contract test suite runs against a stub adapter and fails it for each of: provider shape leakage, missing `known_at`, absent raw payload persistence — *satisfied 2026-09-08: each defect has a deliberately broken stub and a test asserting the suite catches it (§15.12)* |
 | P0-11 | The adapter passes the contract suite; every ingested row traces to a `raw_payload_body_id`; re-running the import is idempotent (row counts unchanged) |
 | P0-12 | ≥95% of teams auto-resolve; every unresolved team appears in the review queue; **zero teams are silently auto-created** |
 | P0-13 | Row counts match the source CSVs; every fact row has non-null `source_id`, `raw_payload_body_id`, `known_at`; spot-check of 20 fixtures against the source is exact |

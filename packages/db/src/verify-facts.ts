@@ -593,10 +593,13 @@ try {
   const [beyond] = await sql<{ t: string | null }[]>`
     SELECT string_agg(tablename, ',') AS t FROM pg_tables
      WHERE schemaname = 'public'
-       AND tablename IN ('match_events','odds_series','odds_ticks','odds_coverage','bookmakers',
-                         'predictions','prediction_markets','prediction_outcomes','team_ratings',
-                         'standings','fixture_match_candidates','competition_coverage')`;
-  check("72. none of the P0-09+ tables exist", beyond?.t === null, beyond?.t ?? "");
+       AND tablename IN ('match_events','odds_coverage','odds_poll_windows','market_consensus',
+                         'value_signals','predictions','prediction_markets','prediction_outcomes',
+                         'team_ratings','standings','fixture_match_candidates','competition_coverage')`;
+  // bookmakers/odds_series/odds_ticks were on this list until P0-09 landed and
+  // created them by approved design; the boundary this check defends is now
+  // P0-10+. odds_coverage stays forbidden - it is deferred, not built (§14.9).
+  check("72. none of the P0-10+ tables exist", beyond?.t === null, beyond?.t ?? "");
   const [trg] = await sql<{ n: number }[]>`
     SELECT count(*)::int AS n FROM pg_trigger
      WHERE NOT tgisinternal AND tgrelid IN ('match_results'::regclass, 'match_stats'::regclass)`;

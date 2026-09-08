@@ -172,8 +172,8 @@ Grouped by owning layer. `timestamptz` everywhere, stored UTC.
 
 | Entity | Key columns | Notes |
 |---|---|---|
-| `bookmakers` | id, slug, name, country_scope, is_sharp | Flag sharp books — they carry the signal |
-| `odds_snapshots` | fixture_id, bookmaker_id, market_type, line, selection, price, captured_at, snapshot_kind (`opening`/`interval`/`closing`) | Partitioned monthly. The volume driver |
+| `bookmakers` | id, slug, name, country_scope, is_sharp | Flag sharp books — they carry the signal — **[SUPERSEDED 2026-09-08]** `is_sharp` is replaced by `sharpness_tier`, and `kind` (`bookmaker` or `exchange`) is added — an exchange's prices are net of commission and its liquidity is itself a signal. **An aggregator is a `data_sources` row, never a bookmaker.** `commission_rate` is permitted for exchanges and never required. Authoritative: **`PHASE-0-SPEC.md` §14.2**. |
+| `odds_snapshots` | fixture_id, bookmaker_id, market_type, line, selection, price, captured_at, snapshot_kind (`opening`/`interval`/`closing`) | Partitioned monthly. The volume driver — **[SUPERSEDED 2026-09-08]** **`odds_snapshots` is not built.** The flat design repeats the whole `(fixture, bookmaker, market, line, selection)` tuple on every row; it is replaced by **`odds_series` + `odds_ticks`** (§4.2). `captured_at` splits into `observed_at`, `provider_at` and `known_at`, none of which is interchangeable; `snapshot_kind` becomes `price_kind` on the tick, where `provider_closing` and `exchange_sp` are distinct from our own last observation. **It is NOT partitioned** — measured, partitioning cost 42 buffers against 1 on the dominant query. Authoritative: **`PHASE-0-SPEC.md` §14**. |
 | `market_consensus` | fixture_id, market_type, line, selection, fair_prob, overround, method (`multiplicative`/`shin`/`power`), n_books, computed_at | De-vigged market truth |
 | `value_signals` | prediction_id, market_type, line, selection, model_prob, market_prob, best_price, bookmaker_id, edge_pct, ev, kelly_fraction, confidence, computed_at | Powers the value board |
 
@@ -201,7 +201,7 @@ Grouped by owning layer. `timestamptz` everywhere, stored UTC.
 
 1. **Append-only for ratings, predictions, odds and performance.** Corrections are new rows. This is what makes backtesting honest and the public performance page defensible.
 2. **`known_at` on every ingested fact** — not `created_at`, but the moment the information became knowable. Everything in §5 depends on it.
-3. **Partition `raw_payloads` and `odds_snapshots` by month.** They will be ~95% of your storage.
+3. **Partition `raw_payloads` and `odds_snapshots` by month.** They will be ~95% of your storage.3. **Partition `raw_payloads` and `odds_snapshots` by month.** They will be ~95% of your storage. — **[SUPERSEDED 2026-09-08]** `raw_payloads` is partitioned monthly and remains so (§9.1). `odds_snapshots` does not exist, and its replacement **`odds_ticks` is deliberately NOT partitioned** — see **`PHASE-0-SPEC.md` §14.10** for the measured plans and the threshold at which to revisit.
 4. **RLS on all user tables** (`profiles`, `subscriptions`, `slips`, `slip_selections`, `follows`). Public tables: read-only to `anon`.
 5. **Premium gating is server-side**, in the API layer. RLS protects user *rows*; it does not hide a premium *field* on a public fixture. Strip those before serialisation.
 
@@ -221,11 +221,33 @@ ProviderAdapter (interface)
   capabilities()                    -> {markets, leagues, latency, rate_limit}
 ```
 
+> **[SUPERSEDED 2026-09-08]** the five-method signature is replaced by a single
+> `fetch` method returning an envelope. A method returning a bare list cannot
+> express pagination state, partial failure, rate-limit state or the
+> raw-payload linkage, so it forced an adapter either to write to the database
+> itself — coupling provider parsing to Postgres — or to drop the evidence:
+>
+> ```
+> ProviderAdapter (Protocol)
+>   provider_slug, adapter_version
+>   capabilities() -> Capabilities
+>   fetch(FetchRequest) -> FetchResult
+>
+> FetchRequest(domain, scope, cursor)
+> FetchResult(records, provenance, next_cursor, complete, problems)
+> ```
+>
+> `next_cursor=None` with `complete=False` is a distinct, representable state,
+> so a failed page can never be mistaken for a finished sync. The adapter is
+> handed an `HttpTransport` and a `RawArchive` port and imports no database
+> code at all. **The rules stated below are unchanged and are exactly what the
+> new shape protects.** Authoritative: **`PHASE-0-SPEC.md` §15**.
+
 Rules: adapters return **canonical DTOs only** — a provider shape must never escape `ingest/adapters/`. Every response body is written to `raw_payloads` *before* parsing. Adding a provider is one new file plus one `data_sources` row; nothing else in the system changes.
 
 ### B. Engine → Database (write contract, enforced by Postgres grants)
 
-The Python engine writes only: `raw_payloads`, canonical football tables, `team_ratings`, `feature_snapshots`, `predictions`, `prediction_markets`, `odds_snapshots`, `market_consensus`, `value_signals`, `prediction_outcomes`, `model_performance`, `job_runs`.
+The Python engine writes only: `raw_payloads`, canonical football tables, `team_ratings`, `feature_snapshots`, `predictions`, `prediction_markets`, `odds_snapshots`, `market_consensus`, `value_signals`, `prediction_outcomes`, `model_performance`, `job_runs`.The Python engine writes only: `raw_payloads`, canonical football tables, `team_ratings`, `feature_snapshots`, `predictions`, `prediction_markets`, `odds_snapshots`, `market_consensus`, `value_signals`, `prediction_outcomes`, `model_performance`, `job_runs`. — **[SUPERSEDED 2026-09-08]** `odds_snapshots` is replaced by `odds_series` + `odds_ticks` (**`PHASE-0-SPEC.md` §14**). The rule that only the Python engine writes these tables is unchanged.
 
 The web app writes only: `profiles`, `subscriptions`, `entitlements`, `slips`, `slip_selections`, `slip_results`, `follows`.
 
@@ -431,7 +453,7 @@ Top-league 1X2 markets are close to unbeatable. Real edge, if it exists, lives i
 
 **6. Odds volume and cost.**
 Books × markets × lines × fixtures × snapshots compounds fast.
-*Mitigation:* monthly partitions, cadence scaled by time-to-kickoff, full fidelity on opening and closing, thin the middle after 90 days.
+*Mitigation:* monthly partitions, cadence scaled by time-to-kickoff, full fidelity on opening and closing, thin the middle after 90 days.*Mitigation:* monthly partitions, cadence scaled by time-to-kickoff, full fidelity on opening and closing, thin the middle after 90 days. — **[SUPERSEDED 2026-09-08]** the mitigation is right in substance and wrong on partitioning: `odds_ticks` is **not partitioned**, because series-scoped queries fan out across every partition (**`PHASE-0-SPEC.md` §14.10**). Change-only recording, cadence scaling and retention tiering all stand.
 
 **7. Calibration drift.**
 Models decay across seasons, rule changes and tactical shifts.

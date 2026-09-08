@@ -16,7 +16,8 @@
     "db:verify-canonical": "node src/verify-canonical.ts",
     "db:verify-external-ids": "node src/verify-external-ids.ts",
     "db:verify-fixtures": "node src/verify-fixtures.ts",
-    "db:verify-facts": "node src/verify-facts.ts"
+    "db:verify-facts": "node src/verify-facts.ts",
+    "db:verify-odds": "node src/verify-odds.ts"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",

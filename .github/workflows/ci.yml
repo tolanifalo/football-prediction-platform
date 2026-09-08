@@ -48,6 +48,7 @@ jobs:
       - run: pnpm db:verify-external-ids
       - run: pnpm db:verify-fixtures
       - run: pnpm db:verify-facts
+      - run: pnpm db:verify-odds
 
   python:
     runs-on: ubuntu-latest

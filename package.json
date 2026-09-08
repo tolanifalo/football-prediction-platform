@@ -24,6 +24,7 @@
     "db:verify-external-ids": "pnpm --filter @fpp/db db:verify-external-ids",
     "db:verify-fixtures": "pnpm --filter @fpp/db db:verify-fixtures",
     "db:verify-facts": "pnpm --filter @fpp/db db:verify-facts",
+    "db:verify-odds": "pnpm --filter @fpp/db db:verify-odds",
     "verify": "pnpm -r typecheck && pnpm -r lint && pnpm py:lint && pnpm py:typecheck && pnpm py:test"
   },
   "devDependencies": {
