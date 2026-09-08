@@ -196,7 +196,7 @@ The stress test below forces four changes to `ARCHITECTURE.md` v1. The canonical
 - **Provider-neutral.** Internal UUIDs only. `external_ids(source, entity_type, external_id, internal_id, valid_from, valid_to, confidence)` — with validity, because provider IDs get merged and reused.
 - **Bitemporal on every correctable fact.** Not just `known_at`, but full revision history: `match_results` and `match_stats` become append-only revision tables with `(known_at, revision, superseded_at)` and a "latest" view. Providers silently revise scores and xG; without this, point-in-time backtests are quietly wrong.
 - **Names are time-scoped, entities are not.** `team_names(team_id, name, valid_from, valid_to)` and the same for competitions. `teams.canonical_name` becomes a view of the currently-valid name.
-- **Fixture identity survives rescheduling.** Identity key is `(season_id, stage, leg, home_team_id, away_team_id)` — *not* one containing `kickoff_utc`.
+- **Fixture identity survives rescheduling.** Identity key is `(season_id, stage, leg, home_team_id, away_team_id)` — *not* one containing `kickoff_utc`. — **[SUPERSEDED 2026-09-08]** the identity key is **six** columns, not five: `replay_number` is part of it, so a replay is a new fixture rather than a duplicate-key violation (**`PHASE-0-SPEC.md` §6 rule 4**, **§12.2**, CLAUDE.md non-negotiable #4). The principle stated here — that identity never contains kickoff time — is unchanged and in force.
 - **Coverage is declared, not discovered.** `competition_coverage(competition_id, season_id, has_xg, has_shots, has_lineups, ...)` so the model knows what it may rely on instead of silently imputing nulls.
 - **Multi-source by construction.** Every fact row carries `source_id`. Two providers may assert the same fixture; reconciliation picks a winner and records the disagreement rather than overwriting.
 
@@ -228,7 +228,7 @@ v1's `match_results` is one row per fixture; an UPDATE destroys the record the m
 
 ### 6.5 Fixture rescheduling — **DEFECT**
 
-v1's `UNIQUE(season_id, home_team_id, away_team_id, kickoff_utc)` contains the kickoff time, so a rescheduled match inserts a **duplicate** instead of updating. Fix: key on `(season_id, stage, leg, home_team_id, away_team_id)`.
+v1's `UNIQUE(season_id, home_team_id, away_team_id, kickoff_utc)` contains the kickoff time, so a rescheduled match inserts a **duplicate** instead of updating. Fix: key on `(season_id, stage, leg, home_team_id, away_team_id)`. — **[SUPERSEDED 2026-09-08]** the identity key is **six** columns, not five: `replay_number` is part of it, so a replay is a new fixture rather than a duplicate-key violation (**`PHASE-0-SPEC.md` §6 rule 4**, **§12.2**, CLAUDE.md non-negotiable #4). The principle stated here — that identity never contains kickoff time — is unchanged and in force.
 Additional rule: **a kickoff change greater than 24 hours invalidates every prediction for that fixture** — the teams' form, injuries and rest have changed. Abandoned matches replayed from 0-0 are a *new* fixture; awarded results are a settlement event, not a football result, and must be flagged so they never train the goals model.
 
 ### 6.6 Team renames — **DEFECT (shared with 6.7)**
@@ -277,7 +277,7 @@ Four hidden problems. (a) Books offer **different lines** — averaging a 2.5 an
 4. **Provider-neutral core**: internal UUIDs, `external_ids` with validity ranges, `raw_payloads` archive, adapter interface. No provider ID is ever a primary key.
 5. **The odds source is decoupled from the football-data source** — separate vendors, separate contracts, separate adapters.
 6. **Bitemporal facts**: `match_results` and `match_stats` are append-only revision tables. Non-negotiable, and near-impossible to retrofit.
-7. **Fixture identity key** = `(season_id, stage, leg, home_team_id, away_team_id)`. Never includes kickoff time.
+7. **Fixture identity key** = `(season_id, stage, leg, home_team_id, away_team_id)`. Never includes kickoff time. — **[SUPERSEDED 2026-09-08]** the identity key is **six** columns, not five: `replay_number` is part of it, so a replay is a new fixture rather than a duplicate-key violation (**`PHASE-0-SPEC.md` §6 rule 4**, **§12.2**, CLAUDE.md non-negotiable #4). The principle stated here — that identity never contains kickoff time — is unchanged and in force.
 8. **Validity-scoped names** for teams and competitions.
 9. **Append-only predictions, ratings, odds**; `superseded_at` + partial unique index, not `is_current`.
 10. **Odds capture begins in week one**, storing changes rather than polls.

@@ -22,6 +22,7 @@
     "db:verify-partitions": "pnpm --filter @fpp/db db:verify-partitions",
     "db:verify-canonical": "pnpm --filter @fpp/db db:verify-canonical",
     "db:verify-external-ids": "pnpm --filter @fpp/db db:verify-external-ids",
+    "db:verify-fixtures": "pnpm --filter @fpp/db db:verify-fixtures",
     "verify": "pnpm -r typecheck && pnpm -r lint && pnpm py:lint && pnpm py:typecheck && pnpm py:test"
   },
   "devDependencies": {

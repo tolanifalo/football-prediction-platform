@@ -146,7 +146,7 @@ Grouped by owning layer. `timestamptz` everywhere, stored UTC.
 | `teams` | id, slug, canonical_name, short_name, country_id, crest_url, founded |
 | `team_aliases` | team_id, alias, source_id, confidence · **required** for entity resolution |
 | `venues` | id, name, city, country_id, capacity, latitude, longitude |
-| `fixtures` | id, competition_id, season_id, matchweek, home_team_id, away_team_id, kickoff_utc, status (`scheduled`/`live`/`ft`/`postponed`/`abandoned`), venue_id, updated_at · UNIQUE(season_id, home_team_id, away_team_id, kickoff_utc) |
+| `fixtures` | id, competition_id, season_id, matchweek, home_team_id, away_team_id, kickoff_utc, status (`scheduled`/`live`/`ft`/`postponed`/`abandoned`), venue_id, updated_at · UNIQUE(season_id, home_team_id, away_team_id, kickoff_utc) — **[SUPERSEDED 2026-09-08]** every element of this row is wrong now. Identity is `UNIQUE (season_id, stage, leg, replay_number, home_team_id, away_team_id)` and **never contains `kickoff_utc`**; `kickoff_utc`, `status` and `venue_id` live on the bitemporal `fixture_schedule`, **not** on `fixtures` — putting them here would make every backtest read the match's final state (**§12.7**); there is no `competition_id` (reached via `season_id`) and no `matchweek`. `status` also gains `suspended` and `cancelled`. Authoritative: **`PHASE-0-SPEC.md` §12**. |
 | `match_results` | fixture_id, ht_home, ht_away, ft_home, ft_away, aet_home, aet_away, pens_home, pens_away, settled_at |
 | `match_stats` | fixture_id, team_id, is_home, shots, shots_on_target, corners, yellow, red, possession, xg, xga, deep_completions · one row per team per match |
 | `match_events` | fixture_id, minute, type, team_id, player_id · Phase 8 (live) and time-decayed models |

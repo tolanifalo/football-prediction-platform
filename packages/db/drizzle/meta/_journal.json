@@ -64,6 +64,27 @@
       "when": 1788867036614,
       "tag": "0008_p0_06_asof_triggers_grants",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1788877589658,
+      "tag": "0009_p0_07_fixtures",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1788877604697,
+      "tag": "0010_p0_07_asof_grants",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1788878933383,
+      "tag": "0011_p0_07_fixture_idx",
+      "breakpoints": true
     }
   ]
 }

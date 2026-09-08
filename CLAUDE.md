@@ -24,7 +24,7 @@ These are expensive or impossible to retrofit. Do not relax one without an expli
 3. **Fact tables are append-only.** Corrections insert a new revision and set `superseded_at`. Enforced by column-level GRANT, not convention.
 4. **Fixture identity never contains kickoff time** — `(season_id, stage, leg, replay_number, home_team_id, away_team_id)`. Rescheduling must not create a duplicate.
 5. **`teams` has no name column.** Names live in `team_names` with validity ranges, half-open `[valid_from, valid_to)`. Names are **closed, never edited** — `GRANT UPDATE (valid_to)` only (§10.6).
-6. **Every fact row carries `source_id`, `raw_payload_body_id`, `known_at`.** No exceptions. The body reference is a single-column FK to the unpartitioned `raw_payload_bodies`; keeping it single-column is why the raw archive is split (`PHASE-0-SPEC.md` §9.1).
+6. **Every fact row carries `source_id`, `raw_payload_body_id`, `known_at`.** No exceptions. **"Fact" means a claim two providers could disagree about** — a result, a stat, a schedule revision, a mapping. Canonical identity registries (`teams`, `competitions`, `seasons`, `fixtures`) are not facts and carry none of the three; the fact rows that reference them do. That line is drawn in `PHASE-0-SPEC.md` §12.3, not by taste. The body reference is a single-column FK to the unpartitioned `raw_payload_bodies`; keeping it single-column is why the raw archive is split (`PHASE-0-SPEC.md` §9.1).
 7. **A price is only "closing" if the source defines it as closing.** Our own last observation is `last_observed_pre_kickoff` and is not the same thing.
 8. **Odds ticks are written only on change**, never per poll.
 9. **The database is the engine↔app interface.** The web app never invokes the model in a request path.

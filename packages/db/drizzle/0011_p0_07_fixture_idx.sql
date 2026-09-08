@@ -1,0 +1,1 @@
+CREATE INDEX "fixture_schedule_fixture_idx" ON "fixture_schedule" USING btree ("fixture_id");

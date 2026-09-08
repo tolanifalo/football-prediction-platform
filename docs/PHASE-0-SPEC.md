@@ -1017,6 +1017,242 @@ P0-06 does **not** create: any matching, scoring or fuzzy-resolution logic, `fix
 
 ---
 
+# 12. Fixture identity (P0-07)
+
+Approved 2026-09-08 after a read-only design review that surfaced fourteen decisions the specification had never fixed, two of which would have produced a schema unable to load three of the four launch competitions. All fourteen are ruled below.
+
+**This section is design only.** No schema, migration or verification exists yet. Where a rule below is conditional on a disposable probe, it says so.
+
+P0-07 builds the join between the canonical entities of P0-05 and every fact that will ever be attached to a match. `fixtures` says *which contest*; `fixture_schedule` says *when, where and in what administrative state* — and, being bitemporal, *when we came to believe it*.
+
+## 12.1 Scope
+
+**Owns:** `fixtures`, `fixture_schedule`, the `fixture_schedule_as_of(cutoff)` wrapper, grants on both, and `db:verify-fixtures`.
+
+**Does not own:** any football result. Scores, half-time scores, extra time, penalties, `is_trainable` and `result_source` are `match_results` — **P0-08** (§B, §D). Odds are P0-09. Cross-provider fixture matching is P0-12 (§11.6). Provider adapters are P0-10/11. There is no scheduler in Phase 0 (§G).
+
+**Dependencies are 04, 05 and 06** — `data_sources` and `raw_payload_bodies` for the provenance columns on `fixture_schedule`, the canonical registries for the identity foreign keys, and `fn_visible_at` for the schedule wrapper. *(§D's task row read `05` alone until corrected 2026-09-08.)*
+
+## 12.2 Canonical identity — six columns, all NOT NULL
+
+```
+UNIQUE (season_id, stage, leg, replay_number, home_team_id, away_team_id)
+```
+
+Unchanged from §6 rule 4 and CLAUDE.md non-negotiable #4, and it **never contains kickoff time**: that is the defect `DECISIONS-01` §6.5 records, where a rescheduled match inserted a duplicate instead of revising.
+
+`fixtures.id` is a **UUID** *(D5)*. Not stylistic. `fixtures` is the most-referenced foreign-key target in the finished schema — `match_results`, `match_stats`, `odds_series`, `odds_coverage`, `feature_snapshots`, `predictions` and `fixture_match_candidates` all point at it — and `external_ids.internal_id` is `uuid`, so a `bigint` key would permanently foreclose ever mapping a fixture through the external identity layer. §10.5 made exactly this argument for the five canonical registries; it applies here with more force, not less.
+
+### `stage` *(D1)*
+
+**`stage` is free `text`. There is no `CHECK` enumerating its values, and none may be added.**
+
+It is a **provider-independent structural stage identifier**: it names where in a season's structure the meeting sits, in our vocabulary, never a provider's.
+
+**`stage` MUST distinguish structurally repeated meetings within a season, including repeated round-robin rounds.** This is the load-bearing rule, and it is not hypothetical. The Scottish Premiership plays a **three-round** pre-split phase — twelve clubs, thirty-three matches — and over three rounds one club hosts the other **twice**. Celtic host Rangers twice in a single season: same season, same teams, same home side, one leg, no replay. The Welsh and Northern Irish leagues split the same way, and §10.1 names England, Scotland, Wales and Northern Ireland as launch competitions. Without a `stage` that separates the rounds, that second meeting is a duplicate-key violation and three of the four launch competitions cannot be loaded.
+
+Values such as `regular`, `regular_r1`, `regular_r2`, `regular_r3`, `championship_split`, `group_a`, `quarter_final`, `semi_final`, `final` are **examples of the convention, not an enumeration.** They are written here to show the shape and for no other purpose.
+
+The reason a `CHECK` is refused is the reason §11.2 refused one on `entity_review_queue.reason`: a closed set fixes the vocabulary before the competitions that need it are known, and every future format reform — the Champions League league phase broke every schema that assumed group stages (`DECISIONS-01` §6.8) — would arrive as a migration on a constraint rather than a row. §6 rule 6 already forbids any code path that assumes a league structure; enumerating `stage` would be that assumption in constraint form.
+
+### `leg` and `replay_number` *(D2)*
+
+All three of `stage`, `leg` and `replay_number` are **`NOT NULL`**.
+
+This is not a style preference and it is not defensive habit. In PostgreSQL, NULLs in a unique index are distinct from one another by default, so **a single NULL in any of the six columns silently disables duplicate-fixture prevention altogether** — no error, no warning, and the constraint appears to exist. `NOT NULL` is what makes the identity key mean what it says.
+
+| Column | Value | Meaning |
+|---|---|---|
+| `leg` | `1` | A single-leg fixture, **or** the first leg of a two-legged tie |
+| `leg` | `2` | The second leg of a two-legged tie |
+| `replay_number` | `0` | The original fixture |
+| `replay_number` | `1`, `2`, … | Successive replays |
+
+`leg = 1` covering both the single-leg case and the first leg **widens §6 rule 5**, which said `leg ∈ {1,2}` without providing any value for a fixture that is not part of a tie — that is, for the overwhelming majority of fixtures. The widening is deliberate and recorded here so it is not later read as drift.
+
+`tie_id` remains the marker of a genuine two-legged tie (§12.5), so "leg 1 of a tie" and "the only leg" stay distinguishable: the first has a `tie_id`, the second does not.
+
+### Data-quality constraints on identity
+
+`home_team_id <> away_team_id`; `replay_number >= 0`; `leg IN (1,2)`; `replaces_fixture_id <> id`; `tie_id IS NOT NULL` implies `leg IN (1,2)`. All ordinary `CHECK`s.
+
+**Not enforceable, and recorded as such rather than quietly skipped:** that both teams belong to the season's competition cannot be constrained, because §10.8 deliberately has no participation table — participation is *derived from fixtures*, so the constraint would be circular. That both teams match the competition's `gender` and `age_group` is a cross-row condition; it belongs to entity resolution (P0-12) and to the P0-14 assertion suite, not to a fixture constraint.
+
+## 12.3 Identity versus fact — where provenance lives *(D3)*
+
+**`fixtures` carries no `source_id`, no `raw_payload_body_id` and no `known_at`. `fixture_schedule` carries all three.**
+
+This must be read as a **distinction, not an exemption**, and CLAUDE.md non-negotiable #6 is not narrowed by it.
+
+The rule that governs is: **provenance attaches to claims we could have learned wrongly.** A schedule revision is such a claim — a provider said the match kicks off at 15:00 at Goodison, and may say otherwise tomorrow. A fixture *row* is not: it is our own assertion that a contest exists, keyed on six values that are immutable by definition, and it is the anchor other people's claims are hung from.
+
+`fixtures` is therefore a **canonical identity registry**, and behaves exactly as the P0-05 registries do (§10). `teams`, `competitions` and `seasons` carry none of the three columns either, for the same reason, and no one has ever argued they violate #6. `fixtures` joins them.
+
+The practical test, for any future table: *can two providers disagree about this row's contents?* If yes, it is a fact and carries provenance. If the row's whole content is its identity, it is a registry entry and does not. The line is drawn here rather than left to taste, precisely so that a later task cannot quietly move it.
+
+One consequence follows and is addressed in §12.4: because `fixtures` has no `known_at`, **the existence of a fixture at a past cutoff is answered by its schedule, never by `fixtures` alone.**
+
+## 12.4 `fixture_schedule` — the bitemporal fact layer
+
+Columns, per §6 rule 1 and the rulings below:
+
+```
+fixture_id, kickoff_utc, local_date, local_tz, venue_id, status,
+is_neutral_venue, source_id, raw_payload_body_id, known_at, superseded_at
+```
+
+`source_id` and `raw_payload_body_id` are additions to rule 1's list, which omitted them; CLAUDE.md #6 requires them of every fact row and the omission was an incompleteness, not an exemption. `raw_payload_body_id` is a single-column FK to the unpartitioned `raw_payload_bodies` — the reason §9.1 split the archive in the first place.
+
+Primary key: `bigint generated always as identity`, matching `external_ids` and the §9.7 convention for append-only log-style rows.
+
+Read only through **`fixture_schedule_as_of(cutoff)`**, which delegates to `fn_visible_at` and never restates the predicate (§11.1). `LANGUAGE sql` is load-bearing: a PL/pgSQL equivalent is an optimisation barrier.
+
+Supersession follows §2.2 — append a revision, set `superseded_at` on the old row — and §10.4's operational rule applies unchanged: unique indexes are **not deferrable** and a one-shot flip is order-dependent, so closing the old revision and inserting the new one are **two ordered statements, never one**.
+
+### Timezone columns
+
+Per §6 rule 11, unchanged: `kickoff_utc timestamptz` stored UTC; `local_date date` computed and stored **at ingest, not generated**, because a competition's timezone can itself change; `local_tz` an IANA zone name. **Any ingested datetime lacking an explicit UTC offset is rejected, never inferred** — DST is handled for free by storing instants, and the real hazard is providers publishing wall-clock time, which the rejection rule catches.
+
+`local_date` exists because the match date is not the UTC date: a 20:00 kickoff in Brazil falls on the next UTC day, so "today's fixtures" computed from the UTC date is wrong for a continent (`DECISIONS-01` §6.11).
+
+**The agreement between `local_date`, `kickoff_utc` and `local_tz` IS enforceable declaratively** *(D11, confirmed 2026-09-08 by disposable probe on PostgreSQL 17.6)*:
+
+```sql
+CHECK (local_date = (kickoff_utc AT TIME ZONE local_tz)::date)
+```
+
+`timezone(text, timestamptz)` — what `AT TIME ZONE` with a text zone compiles to — is **`IMMUTABLE`** in PostgreSQL 17.6. An earlier revision of this paragraph claimed it was `STABLE` and therefore barred from a `CHECK`; that was wrong.
+
+The evidence matters, because acceptance alone proves nothing here: **PostgreSQL 17.6 does not check volatility in `CHECK` constraints at all** — `now()`, `random()` and both STABLE and VOLATILE PL/pgSQL functions were all accepted. It *does* enforce it for generated columns and index expressions (`42P17` for both). The deciding test is therefore the strict one: **an index on the bare `(kickoff_utc AT TIME ZONE local_tz)::date` expression is accepted**, which only a genuinely immutable expression can be.
+
+The same constraint rejects an invalid IANA zone at insert time with **`22023`** (`time zone "Europe/Narnia" not recognized`), so one constraint covers both invariants.
+
+**No trigger is added** for `local_date`/`local_tz` consistency. **Verifier-level validation is retained as a secondary guard**: a `CHECK` is evaluated on write and never re-validated, so a future image shipping updated tzdata could leave stored rows disagreeing with the constraint they were written under. The `CHECK` cannot retroactively reject anything; the verifier is what would notice.
+
+A `GENERATED ALWAYS AS … STORED` column is also accepted by PostgreSQL and is **not** used: §6 rule 11 stores `local_date` at ingest precisely because a competition's timezone can change, and a stored generated column is recomputed on a table rewrite.
+
+### `status` — administrative state only *(D4)*
+
+Exactly seven values, as a `CHECK`:
+
+```
+scheduled · live · suspended · ft · postponed · abandoned · cancelled
+```
+
+`suspended` and `cancelled` are additions: the corpus previously named only five, in a superseded section of `ARCHITECTURE.md`, and a match called off and never replayed is genuinely not the same thing as a postponed one. Forcing it into `postponed` would be a lie told by the schema.
+
+**`awarded`, `walkover` and `forfeit` are NOT schedule statuses and must never be added as such.** They are result semantics and belong to P0-08's `match_results.result_source`. §6 rule 3 is the governing sentence: *awarded scores are administrative outcomes and must never train the goals model — they still settle bets.* A 3–0 walkover is a real settlement fact and a fictional football fact, and the schema keeps both apart by putting them in different tables. Adding `awarded` here would create a second, competing representation of the same event and guarantee they eventually disagree.
+
+**`status` lives on `fixture_schedule` and nowhere else.** It is not denormalised onto `fixtures`. Neither is `kickoff_utc`. The reason is §12.7.
+
+### Lifecycle rules, unchanged from §6
+
+- **Reschedule** — a new schedule revision. Same `fixture_id`. Never a new fixture (rule 1).
+- **Postponement** — `status = 'postponed'`; the replayed match is the **same `fixture_id`** with a new revision. Postponement does not break identity (rule 2).
+- **Abandonment** — `status = 'abandoned'`; the untrainability of the result is `match_results.is_trainable`, in P0-08 (rule 3).
+- **Replay from 0–0** — a **new fixture row**, `replay_number` incremented, `replaces_fixture_id` pointing at the original (rule 4). A replay is a different contest; a reschedule is the same contest at a different time.
+- A kickoff move greater than 24 hours **supersedes every prediction for that fixture** (rule 1). P0-07 produces the schedule revision; the supersession belongs to whichever task owns `predictions`, and P0-07 builds no artifact for it.
+
+### `is_neutral_venue` *(D13)*
+
+A boolean on `fixture_schedule`, not on `fixtures`.
+
+It is on the schedule because **the neutral designation moves with the venue**, and the venue is a schedule attribute: a tie relocated to a third country, a final at a neutral ground, a match moved behind closed doors to a shared stadium. A relocation is a schedule revision, and the neutrality of the new venue must revise with it.
+
+It matters downstream out of proportion to its size. **Home advantage is a direct model input** (`ARCHITECTURE.md` §5), and a neutral-ground match scored as a home match is a silent modelling error — no NULL, no exception, no failing test, just a systematically wrong prior on every neutral fixture. `ARCHITECTURE.md` §10 risk 8 already names neutral venues among the things that "quietly corrupt results and settlement". This column is the correction.
+
+It is an addition beyond the previous specification, recorded here as such.
+
+### No `actual_kickoff_utc` *(D14)*
+
+Not added. The revision whose `status` becomes `live` carries its own `known_at`, which already bounds the real kickoff, and §4.3's rule — that the `last_observed_pre_kickoff` capture is triggered by **the status transition to `live`, not by the scheduled kickoff time** — is satisfiable from that transition alone. A dedicated column would be a second derivation of something the bitemporal record already holds.
+
+### Every fixture has at least one schedule revision *(D10)*
+
+**Mandatory.** The initial `fixtures` row and its initial `fixture_schedule` revision are created **in the same transaction**.
+
+It is enforced by the verifier and by the ingestion rule, **not by a database constraint**: a fixture requiring a schedule that requires a fixture is circular, and no deferrable constraint resolves it cleanly.
+
+The rule is not tidiness. Because `fixtures` carries no `known_at` (§12.3), a fixture with no schedule revision is **invisible to every as-of query and present in every current-state query** — the worst of both, and exactly the shape a leakage bug takes.
+
+## 12.5 Deliberately not built
+
+- **No fixture provider IDs** *(D6)*. Deferred entirely. **P0-07 makes no change to P0-06's `external_ids`** — not to the `entity_type` `CHECK`, not to `trg_external_ids_integrity()`, not to the canonical-side delete triggers. §11.4's five permitted entity types stand unamended.
+
+  The deferral is not merely conservative. Nothing before P0-11 ingests a fixture, and **P0-11's provider — football-data.co.uk CSV — has no fixture identifiers at all**; it identifies a match by date, home and away. There is nothing to map. Cross-provider fixture identity is already assigned: `fixture_match_candidates` is **P0-12** (§11.6), scored on teams, ±3 days and competition (§6 rule 10). Adding a sixth entity type now would mean writing and verifying a trigger branch that no code exercises for five tasks.
+
+- **No `ties` table** *(D7)*. `tie_id` is a **nullable `uuid` with no foreign key and no table behind it.** §6 rule 5 says the tie is "where aggregate-score logic lives" — but aggregate score is a **computation over two fixtures' results**, performed in Phase 1, not a canonical registry with an identity of its own. A table would be state that can disagree with the fixtures it summarises, which is the argument §10.8 used to refuse a participation table.
+
+- **No `fixtures.competition_id`** *(D8)*. The competition is reached through `season_id → seasons.competition_id`, one join away. A denormalised copy is a second source of truth that can diverge from the season it contradicts.
+
+- **No `matchweek` or `round` column** *(D12)*. It appears in `ARCHITECTURE.md` §3 — a superseded section — and in no current specification. Where round-robin round is structurally significant it is already carried by `stage` (§12.2), which makes a separate column redundant as well as unspecified.
+
+- **No partitioning, no extensions, no exclusion constraints.** Phase 0's ceiling is roughly 7,000 fixtures (P0-13); the global ceiling is low hundreds of thousands. §10.4 settled that partial unique indexes cover every temporal guarantee required.
+
+## 12.6 Permissions *(D9)*
+
+Column-level `GRANT`, following §2.2, §9.3 and §10.6. Not Drizzle-expressible, so it lives in a `--custom` migration as `0006` and `0008` do.
+
+```
+GRANT SELECT, INSERT ON fixtures TO engine_rw;
+GRANT UPDATE (stats_complete_at, tie_id, replaces_fixture_id) ON fixtures TO engine_rw;
+
+GRANT SELECT, INSERT ON fixture_schedule TO engine_rw;
+GRANT UPDATE (superseded_at) ON fixture_schedule TO engine_rw;
+
+GRANT SELECT ON fixtures, fixture_schedule TO app_rw;
+GRANT SELECT ON fixtures, fixture_schedule TO analytics_ro;
+```
+
+**`engine_rw` may UPDATE exactly three columns on `fixtures`** — `stats_complete_at`, `tie_id`, `replaces_fixture_id` — because each is genuinely learned after the fixture is created: a stats-completeness watermark when late data lands (§6 rule 13), a tie relationship when the draw is understood, a replay link when the replay is scheduled. **Every identity column is immutable by privilege.**
+
+**No `DELETE` to any role**, on either table. A fixture anchors results, odds, feature snapshots and predictions; the same reasoning withholds `DELETE` on `competitions` and `seasons` in §10.6. **No `TRUNCATE` to any role**, per §11.3.
+
+What this makes impossible at the database level, rather than by convention: rewriting a kickoff in place, rewriting a status in place, re-pointing a fixture at a different team or season, and deleting a fixture. Every one of those is a silent history rewrite that no test of current state would catch.
+
+Unlike `external_ids`, every reference here is a **real foreign key**, so §11.3's polymorphic-trigger machinery does not recur. The case worth verifying rather than assuming is `venues`: `engine_rw` holds `DELETE` on it (§10.6), and a real FK must refuse the deletion of a referenced venue with no trigger involved.
+
+## 12.7 Leakage
+
+CLAUDE.md non-negotiable #2 — features read only facts with `known_at <= data_cutoff`, through the shared as-of mechanism — resolves here into four concrete rules.
+
+**1. `status` on the bitemporal table is the whole defence.** Were `status` a mutable column on `fixtures`, as the superseded `ARCHITECTURE.md` §3 had it, every backtest reading a fixture would see its **final** status. `ft` is post-kickoff knowledge by definition. There would be no error and no NULL: a feature builder asking "is this match on?" three days before kickoff would be answered with the fact that the match finished. On `fixture_schedule`, a pre-kickoff cutoff returns `scheduled`, because that is all we knew.
+
+**2. The same forbids denormalising kickoff.** A cached `fixtures.kickoff_utc` shows the *final* kickoff, not the one known at the cutoff. Rest days, congestion and travel are all computed from kickoff intervals (`ARCHITECTURE.md` §5), so a leaked kickoff leaks straight into the feature vector.
+
+**3. Fixture existence is itself point-in-time information.** `fixtures` has no temporal columns, so a fixture created after a cutoff is visible in `fixtures` forever. **Never read `fixtures` alone in a point-in-time context** — always join to `fixture_schedule_as_of(cutoff)`, where a fixture with no visible revision correctly disappears. D10 is what makes that reliable.
+
+**4. `stats_complete_at` is a leak, and is named as one.** It is a mutable current-state column on a non-temporal table, so no as-of query can hide it: a backtest at a pre-kickoff cutoff reads a value set hours after full time, and its mere non-NULLness reveals that the match finished and its stats arrived. It is **watermark machinery for job scheduling** (§6 rule 13) and **must never be read by a feature builder.** It is a required target of P0-15's leakage tests, which `ARCHITECTURE.md` §7 calls the most important tests in the repository.
+
+**What this does not do.** The mechanism makes the correct read available and the incorrect read visible. It does not make the incorrect read impossible — `SELECT * FROM fixture_schedule WHERE superseded_at IS NULL` still compiles and still leaks. The barriers in Phase 0 are the grant model, the single-place catalog assertion of §11.1, and P0-15's leakage tests. Not a lock.
+
+## 12.8 Migration and verification shape
+
+**Drizzle-managed:** both tables, in full. Neither belongs under `src/raw-sql/**` — that directory is only for objects whose DDL Drizzle cannot emit. §10.4 verified that `uniqueIndex(...).where(...)` generates and enforces correctly, and both tables are plain, unpartitioned and extension-free.
+
+**`--custom` SQL, in the same ledger:** the `fixture_schedule_as_of` wrapper (Drizzle cannot express `CREATE FUNCTION`) and the grants (column-level `GRANT` is not Drizzle-expressible).
+
+**Indexes, deliberately minimal** — at Phase 0 volumes, speculative indexing is cost without benefit. There is deliberately **no index on `known_at`** *(ruled 2026-09-08)*: the query probe found no consumer for one, and P0-06's `external_ids_known_at_idx` is not a reason to carry an unused index here.
+
+**`fixture_schedule (fixture_id)` is a FULL index, and the partial current index does not replace it** *(added 2026-09-08 during P0-07 implementation)*. It is the parent-key lookup and the primary access path for a historical as-of read; **P0-08 is the immediate consumer**. The partial index cannot serve that read at all — `fixture_schedule_current_idx` is restricted to `superseded_at IS NULL`, while the as-of predicate also admits rows whose `superseded_at` is **later than the cutoff**. Without the full index a single-fixture as-of lookup is a sequential scan. This is a fundamental key index, not speculative tuning.
+
+Bulk scans remain scans: the team-form join reads every visible revision, roughly 2 MB at the Phase 0 ceiling, which is correct and cheap.
+
+```
+fixtures          identity unique; (home_team_id); (away_team_id)
+fixture_schedule  unique (fixture_id) WHERE superseded_at IS NULL
+                  (fixture_id)                    -- full, not partial
+                  (kickoff_utc) WHERE superseded_at IS NULL
+```
+
+**`db:verify-fixtures` must prove**, at minimum: the three §E acceptance criteria; that a duplicate identity key, a `home = away` fixture and a second current schedule revision are each rejected; that a reschedule read as-of the earlier cutoff returns the **old** kickoff while the current read returns the new one; that `engine_rw` is **refused** `UPDATE` on `home_team_id` and on `kickoff_utc`, **permitted** on `superseded_at`, and refused `DELETE` on both tables; that deleting a referenced venue is refused; that `fixture_schedule_as_of` delegates to `fn_visible_at` without restating the predicate, and that the verifier file itself restates it **zero** times; and that a selective filter through the wrapper still plans as an index scan.
+
+The verifier must be **meta-tested** by deliberately breaking an invariant, must be **idempotent** (no fixed identifiers — the defect that required commit `812a180`), and must wrap every negative probe in a `SAVEPOINT`, or one expected failure aborts the transaction and every later probe returns `25P02`.
+
+**Regression is part of the task, not a courtesy.** All five existing verifiers must pass unchanged against a freshly migrated database. Two specific exposures: `verify-external-ids` check 19 asserts that **exactly one** object in `public` contains the visibility predicate, so the new wrapper is the first live test of the single-place rule — if it restates instead of delegating, CI fails, by design. And the delete probes in `verify-canonical` and `verify-external-ids` expect an unreferenced `teams` or `venues` row to be deletable; the new foreign keys must not perturb them. Both are to be checked, not assumed.
+
+---
+
 # A. Final architecture
 
 Unchanged from `ARCHITECTURE.md` in shape — three deployables, database as the engine↔app interface, one scoreline matrix deriving all markets. Four amendments:
@@ -1032,7 +1268,7 @@ Unchanged from `ARCHITECTURE.md` in shape — three deployables, database as the
 
 **Canonical** (§10) — `countries`, `venues`, `competitions`, `competition_names`, `seasons` (with `format`), `teams` (**no name column**), `team_names`, `team_aliases`. *`competition_coverage` removed from scope 2026-09-08 — see §10.9.*
 
-**Fixtures** — `fixtures` (identity: `season_id, stage, leg, replay_number, home_team_id, away_team_id`; plus `tie_id`, `replaces_fixture_id`, `stats_complete_at`), `fixture_schedule` (bitemporal).
+**Fixtures** — `fixtures` (identity: `season_id, stage, leg, replay_number, home_team_id, away_team_id`; plus `tie_id`, `replaces_fixture_id`, `stats_complete_at`), `fixture_schedule` (bitemporal). *Fully specified in **§12** (P0-07), which fixes the six identity columns as `NOT NULL`, adds `is_neutral_venue` to `fixture_schedule`, and rules out `competition_id`, `matchweek` and a `ties` table.*
 
 **Facts** — `match_results` (bitemporal, `is_trainable`, `result_source`), `match_stats` (bitemporal), `match_events` (deferred to Phase 8, schema reserved).
 
@@ -1060,7 +1296,7 @@ Championship 2023/24 · consensus ground truth with manual adjudication of disag
 | **P0-04** | Provenance core per §9: `data_sources`, `job_runs`, `raw_payload_bodies` (Drizzle), `raw_payloads` partitioned monthly + `DEFAULT` + `v_raw_payload_seen` (raw-SQL), grants, plus `db:verify-partitions` | 03 |
 | **P0-05** | Canonical entities: countries, competitions, `competition_names`, seasons, teams (no name column), `team_names`, aliases, venues | 03 |
 | **P0-06** | Per §11: the reusable **as-of mechanism** (§11.1), `external_ids` (bitemporal, polymorphic `internal_id` with trigger-enforced integrity), `entity_review_queue` (minimal, generic), grants | 04, 05 |
-| **P0-07** | Fixture identity: `fixtures` + `fixture_schedule` (bitemporal), ties, legs, replays | 05 |
+| **P0-07** | Fixture identity: `fixtures` + `fixture_schedule` (bitemporal), ties, legs, replays | 04, 05, 06 — *[CORRECTED 2026-09-08]* this row previously read `05` alone. `fixture_schedule` carries `source_id` and `raw_payload_body_id` (P0-04) and is read through `fn_visible_at` (P0-06). See §12.1 |
 | **P0-08** | Bitemporal facts: `match_results`, `match_stats`, and **column-level grants**. **Consumes** the as-of mechanism built in P0-06 — *[CORRECTED 2026-09-08]* this row previously claimed ownership of the `as_of` SQL function; see §11.1 | 04, 07 |
 | **P0-09** | Odds model: `bookmakers`, `odds_series`, `odds_ticks`, `odds_coverage` | 04, 07 |
 | **P0-10** | `ProviderAdapter` interface + canonical DTOs + an adapter contract test suite any adapter must pass | 04 |
