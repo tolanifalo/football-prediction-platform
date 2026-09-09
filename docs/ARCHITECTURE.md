@@ -449,7 +449,7 @@ Top-league 1X2 markets are close to unbeatable. Real edge, if it exists, lives i
 
 **5. Entity resolution.**
 "Man Utd" / "Manchester United" / "Man United U21" / relegated clubs / renamed clubs / reserve teams.
-*Mitigation:* `team_aliases` with confidence scores, fuzzy match into a human confirmation queue, and **never silently auto-create a team**.
+*Mitigation:* `team_aliases` with confidence scores, fuzzy match into a human confirmation queue, and **never silently auto-create a team**. — **[SUPERSEDED 2026-09-09]** the middle third of that is not what P0-12 built. There is **no fuzzy match**: resolution is an exact `external_ids` mapping or an exact normalised alias, and anything else is `Ambiguous` or `Unknown` and goes to the queue unresolved. `confidence` stays **NULL** — §11.5 forbids inventing a threshold before matching exists, and exact matching needs none. The human confirmation queue and the never-auto-create rule stand exactly as written. Authoritative: **`PHASE-0-SPEC.md` §17**.
 
 **6. Odds volume and cost.**
 Books × markets × lines × fixtures × snapshots compounds fast.

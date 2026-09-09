@@ -36,6 +36,7 @@ from engine.ingestion.dto import (
     FixtureRef,
 )
 from engine.ingestion.errors import ProblemKind
+from engine.ingestion.meetings import MeetingPlan
 from engine.ingestion.postgres import (
     PostgresCanonicalWriter,
     PostgresJobRunStore,
@@ -86,17 +87,17 @@ class ImportReport:
 
 
 def _verify_unique_pairings(fixtures: list[CanonicalFixture]) -> list[str]:
-    """Every ordered pairing must occur exactly once (§16.5).
+    """Every ordered pairing must occur exactly once (§16.5, §17.5).
 
-    If it does not, STOP and report the offenders rather than inventing meeting
-    ordinals - the generalised regular_m1/m2 rule is a broader identity problem
-    and belongs with P0-12.
+    The rule itself lives in `engine.ingestion.meetings`, which is shared with
+    P0-12 and knows nothing about this provider. Duplicating it here is exactly
+    the mistake the single-place rule exists to prevent, so this function only
+    formats the refusal for the run's error field.
     """
-    seen: dict[tuple[str, str], int] = {}
-    for f in fixtures:
-        key = (f.ref.home_team.name, f.ref.away_team.name)
-        seen[key] = seen.get(key, 0) + 1
-    return [f"{h} v {a} x{n}" for (h, a), n in sorted(seen.items()) if n > 1]
+    plan = MeetingPlan.from_pairings(
+        (f.ref.home_team.name, f.ref.away_team.name) for f in fixtures
+    )
+    return [f"{h} v {a} x{n}" for (h, a), n in sorted(plan.repeated.items())]
 
 
 def run_import(

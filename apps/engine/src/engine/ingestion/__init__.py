@@ -47,6 +47,13 @@ from engine.ingestion.identity import (
     Resolved,
     Unknown,
 )
+from engine.ingestion.meetings import (
+    MeetingIdentity,
+    MeetingPlan,
+    MeetingResolution,
+    Pairing,
+    RepeatedPairing,
+)
 from engine.ingestion.redaction import (
     normalise_headers,
     persistable_headers,
@@ -100,12 +107,17 @@ __all__ = [
     "IngestionError",
     "IngestionStats",
     "JobRunStore",
+    "MeetingIdentity",
+    "MeetingPlan",
+    "MeetingResolution",
+    "Pairing",
     "PayloadRef",
     "Problem",
     "ProblemKind",
     "ProviderAdapter",
     "ProviderRef",
     "RawArchive",
+    "RepeatedPairing",
     "Resolution",
     "Resolved",
     "RetryPolicy",

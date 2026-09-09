@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
+from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
@@ -25,6 +26,14 @@ from engine.ingestion.dto import (
     CanonicalResult,
     CanonicalStats,
     PayloadRef,
+    ProviderRef,
+)
+from engine.ingestion.identity import (
+    Ambiguous,
+    EntityKind,
+    Resolution,
+    Resolved,
+    Unknown,
 )
 from engine.ingestion.runs import RunIdentity, RunStatus
 from engine.ingestion.signatures import body_hash
@@ -587,3 +596,244 @@ class PostgresCanonicalWriter:
                 ),
             )
             return True
+
+
+# ===========================================================================
+# P0-12: identity resolution (PHASE-0-SPEC.md §17)
+# ===========================================================================
+# Reads go through `external_ids_as_of`, the P0-06 wrapper, so the visibility
+# predicate is never restated here (§11.1). Writes hold to the P0-06 grants:
+# SELECT and INSERT, plus UPDATE of `superseded_at` alone. `internal_id` is
+# never rewritten - the trigger would reject it, and rule 5 of §11.3 says a
+# remap supersedes and inserts.
+
+#: Resolution through the P0-06 as-of wrapper. DISTINCT because two rows
+#: mapping one provider key to the SAME canonical entity are redundant, not
+#: ambiguous; two rows disagreeing about the entity genuinely are.
+_MAPPING_AS_OF = """
+SELECT DISTINCT internal_id FROM external_ids_as_of(%s)
+ WHERE source_id = %s AND entity_type = %s AND external_id = %s
+"""
+
+#: The alias fallback, for a provider whose key IS a human-readable string.
+#: `created_at` is passed through fn_visible_at with a NULL supersede time
+#: because an alias is never superseded - delegating rather than writing
+#: `created_at <= cutoff` by hand keeps the predicate in one place (§11.1).
+_ALIAS_LOOKUP = """
+SELECT DISTINCT team_id FROM team_aliases
+ WHERE normalized_alias = %s
+   AND (source_id = %s OR source_id IS NULL)
+   AND fn_visible_at(created_at, NULL::timestamptz, %s)
+"""
+
+_MAPPING_CURRENT = """
+SELECT id, internal_id FROM external_ids
+ WHERE source_id = %s AND entity_type = %s AND external_id = %s
+   AND superseded_at IS NULL
+"""
+
+_MAPPING_INSERT = """
+INSERT INTO external_ids
+  (source_id, entity_type, external_id, internal_id, confidence, known_at)
+VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+"""
+
+_MAPPING_SUPERSEDE = """
+UPDATE external_ids SET superseded_at = %s
+ WHERE id = %s AND superseded_at IS NULL
+"""
+
+#: Idempotent by construction: a second run finds the open item and adds none.
+_REVIEW_INSERT = """
+INSERT INTO entity_review_queue
+  (entity_type, source_id, external_id, candidate_internal_id, reason)
+SELECT %s, %s, %s, %s, %s
+ WHERE NOT EXISTS (
+   SELECT 1 FROM entity_review_queue
+    WHERE entity_type = %s AND source_id = %s AND external_id = %s
+      AND status = 'open')
+RETURNING id
+"""
+
+
+class PostgresIdentityResolver:
+    """The P0-12 resolver: exact matching only, and it refuses to guess.
+
+    Implements the P0-10 `IdentityResolver` Protocol. Two deterministic
+    lookups, in order:
+
+      1. an existing `external_ids` mapping, read as of `as_of`;
+      2. for teams only, an EXACT normalised alias match.
+
+    There is no third step. No edit distance, no token overlap, no score, no
+    "closest" anything. A provider string matching nothing is `Unknown`; one
+    matching two canonical entities is `Ambiguous`. Neither is ever narrowed
+    to a single candidate (§10.3, §6 rule 9).
+
+    Resolution NEVER creates a canonical entity and never writes a mapping.
+    Persisting a decision belongs to `ExternalIdStore`, so a read cannot have
+    a write as a side effect.
+    """
+
+    def __init__(
+        self,
+        conn: psycopg.Connection[Any],
+        *,
+        source_id: UUID,
+        as_of: datetime | None = None,
+    ) -> None:
+        self._conn = conn
+        self._source_id = source_id
+        self._as_of = as_of or datetime.now(UTC)
+
+    @property
+    def as_of(self) -> datetime:
+        return self._as_of
+
+    def _ids(self, sql: str, params: tuple[Any, ...]) -> list[UUID]:
+        with self._conn.cursor() as cur:
+            cur.execute(sql, params)
+            return [UUID(str(r[0])) for r in cur.fetchall()]
+
+    def resolve(self, kind: EntityKind, ref: ProviderRef) -> Resolution:
+        key = ref.provider_key or ref.name
+        mapped = self._ids(
+            _MAPPING_AS_OF, (self._as_of, self._source_id, str(kind), key)
+        )
+        if len(mapped) == 1:
+            return Resolved(entity_kind=kind, internal_id=mapped[0])
+        if len(mapped) > 1:
+            # Overlapping revisions for one key at one instant. The partial
+            # unique index forbids this at the CURRENT time, so arriving here
+            # means a historical cutoff sees two revisions at once - a
+            # supersede written with an overlapping known_at.
+            return Ambiguous(
+                entity_kind=kind,
+                candidates=tuple(sorted(mapped, key=str)),
+                reason="overlapping external_ids revisions at this cutoff",
+            )
+
+        if kind is not EntityKind.TEAM:
+            # Only teams have an alias table. For every other registry an
+            # absent mapping is simply unknown; there is nothing else to try.
+            return Unknown(entity_kind=kind, reason="no external_ids mapping")
+
+        matches = self._ids(
+            _ALIAS_LOOKUP, (key.strip().lower(), self._source_id, self._as_of)
+        )
+        if len(matches) == 1:
+            return Resolved(entity_kind=kind, internal_id=matches[0])
+        if len(matches) > 1:
+            return Ambiguous(
+                entity_kind=kind,
+                candidates=tuple(sorted(matches, key=str)),
+                reason=f"alias matches {len(matches)} teams",
+            )
+        return Unknown(entity_kind=kind, reason="no mapping and no exact alias")
+
+
+class MappingOutcome(StrEnum):
+    """What a call to `ensure` actually did."""
+
+    CREATED = "created"
+    UNCHANGED = "unchanged"
+    #: A current mapping points elsewhere. NEVER auto-remapped.
+    CONFLICT = "conflict"
+
+
+class ExternalIdStore:
+    """Writes identity decisions, and refuses to make one silently.
+
+    `ensure` is the automatic path and is deliberately incapable of changing
+    an existing mapping: a disagreement is recorded for a human (§6 rule 9,
+    "Never auto-remap"). `supersede_and_remap` is the deliberate path, used
+    once a person has decided - it closes the old revision and opens a new one
+    so history stays readable at its own cutoff (§11.3 rule 5).
+    """
+
+    def __init__(self, conn: psycopg.Connection[Any], *, source_id: UUID) -> None:
+        self._conn = conn
+        self._source_id = source_id
+
+    def _current(self, entity_type: str, external_id: str) -> tuple[int, UUID] | None:
+        with self._conn.cursor() as cur:
+            cur.execute(_MAPPING_CURRENT, (self._source_id, entity_type, external_id))
+            row = cur.fetchone()
+            return (int(row[0]), UUID(str(row[1]))) if row else None
+
+    def ensure(
+        self,
+        kind: EntityKind,
+        external_id: str,
+        internal_id: UUID,
+        *,
+        known_at: datetime | None = None,
+        confidence: int | None = None,
+    ) -> MappingOutcome:
+        """Create the mapping if absent; never overwrite a disagreeing one."""
+        current = self._current(str(kind), external_id)
+        if current is not None:
+            if current[1] == internal_id:
+                return MappingOutcome.UNCHANGED
+            return MappingOutcome.CONFLICT
+        with self._conn.cursor() as cur:
+            cur.execute(
+                _MAPPING_INSERT,
+                (
+                    self._source_id,
+                    str(kind),
+                    external_id,
+                    internal_id,
+                    confidence,
+                    known_at or datetime.now(UTC),
+                ),
+            )
+        return MappingOutcome.CREATED
+
+    def supersede_and_remap(
+        self,
+        kind: EntityKind,
+        external_id: str,
+        internal_id: UUID,
+        *,
+        at: datetime | None = None,
+    ) -> bool:
+        """Close the current revision and open a new one, at one instant.
+
+        The two timestamps are the SAME value on purpose: the old row's
+        `superseded_at` equals the new row's `known_at`, so exactly one
+        revision is visible at every cutoff. Overlapping them would make the
+        resolver answer `Ambiguous`, which is the correct response to a
+        history that genuinely says two things at once.
+        """
+        moment = at or datetime.now(UTC)
+        current = self._current(str(kind), external_id)
+        if current is not None and current[1] == internal_id:
+            return False
+        with self._conn.cursor() as cur:
+            if current is not None:
+                cur.execute(_MAPPING_SUPERSEDE, (moment, current[0]))
+            cur.execute(
+                _MAPPING_INSERT,
+                (self._source_id, str(kind), external_id, internal_id, None, moment),
+            )
+        return True
+
+    def file_for_review(
+        self,
+        kind: EntityKind,
+        external_id: str,
+        reason: str,
+        *,
+        candidate: UUID | None = None,
+    ) -> bool:
+        """Record that a human must decide. Idempotent per open item."""
+        with self._conn.cursor() as cur:
+            cur.execute(
+                _REVIEW_INSERT,
+                (
+                    str(kind), self._source_id, external_id, candidate, reason,
+                    str(kind), self._source_id, external_id,
+                ),
+            )
+            return cur.fetchone() is not None

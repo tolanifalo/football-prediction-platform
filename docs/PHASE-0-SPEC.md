@@ -1012,7 +1012,7 @@ Ownership of everything adjacent, stated so no later task has to re-derive it:
 | As-of mechanism — consumption for `match_results`, `match_stats` | **P0-08** (consumes; owns neither) |
 | Resolution and matching semantics, `confidence` interpretation, thresholds | **P0-12** |
 | `entity_review_queue` — population and operational use | **P0-12** (P0-06 creates the empty table) |
-| `fixture_match_candidates` | **P0-12** (§11.6) |
+| `fixture_match_candidates` | **P0-12** (§11.6) — **[SUPERSEDED 2026-09-09]** not built; see §17.7 |
 | Nightly mapping re-verification job | **Phase 1** — Phase 0 has no scheduler (§G) |
 | Administrative / retention roles, `TRUNCATE` privilege | Outside P0-06 (§11.3) |
 
@@ -1893,6 +1893,100 @@ Postponed and abandoned fixtures are **absent from the source**, so every ingest
 
 ---
 
+# 17. Identity resolution (P0-12)
+
+P0-06 built the mechanism; P0-11 imported real data through it. P0-12 makes the join operational for that data. **Application layer only — no table, no column, no migration.** The rule the whole task exists to enforce is one line: **never guess.**
+
+## 17.1 What this provider actually identifies
+
+football-data.co.uk supplies no opaque primary keys, so the question "what is the external ID" has to be answered honestly per entity rather than assumed.
+
+| Entity | Provider key | Recorded? |
+|---|---|---|
+| Competition | `Div` = `E0` | **Yes.** The provider's own division code |
+| Season | `2324` **/** `E0` | **Yes** — see below |
+| Team | the name string (`Man City`, `Nott'm Forest`) | **Yes.** For this provider the display string *is* the identifier |
+| Country | — | **No.** The CSV carries no country token; `England` is our catalogue's reading of `E0`, not the provider's claim |
+| Venue | — | **No.** Not supplied at all (§16.1) |
+| Fixture | — | **No.** §11.4's five entity types stand unamended; the provider has no fixture identifiers |
+
+**The season key is a pair, and that is not a convenience.** The provider addresses this resource at `/mmz4281/2324/E0.csv`. Recording `2324` alone would assert that one token identifies one season *of one competition* — but that folder holds every division's file for that year, so `2324` names twenty leagues. The next division imported would collide on `external_ids_current_idx` and the mapping would be wrong before it was rejected. `2324/E0` is taken from the provider's own path; it invents nothing.
+
+**Team strings live in both `team_aliases` and `external_ids`, and the two are not redundant.** An alias is a *matching string* — input to resolution, many-to-one, contributed by whoever spells it that way. A mapping is a *decision* — bitemporal, supersedable, and the audit record of what we concluded and when. For a provider whose key happens to be human-readable the two carry the same text; they answer different questions.
+
+## 17.2 The resolver
+
+`PostgresIdentityResolver` implements the P0-10 `IdentityResolver` Protocol. Two deterministic lookups, in order, and **no third step**:
+
+1. an `external_ids` mapping, read through **`external_ids_as_of`** — the P0-06 wrapper, never a restated predicate (§11.1);
+2. **teams only**, an exact normalised alias match.
+
+Trailing whitespace and case are normalised. Nothing else is. `Man Cty` does not match `Man City`; neither does `Man`, `Manchester City` or `Man City FC`. There is no edit distance, no token overlap, no score, no threshold and no "closest" anything, and `confidence` is left NULL because §11.5 gives P0-12 the right to define its meaning and nothing yet requires one.
+
+Three outcomes, and only one yields an identity:
+
+- **`Resolved`** — exactly one candidate.
+- **`Ambiguous`** — more than one. The candidates are returned; **none is chosen**. A review item is filed naming no candidate, because recording one of several *is* the guess.
+- **`Unknown`** — none. The common case at scale, not an error.
+
+**A mapping outranks an alias.** An explicit decision beats a matching string, so a correction made in `external_ids` is not silently overridden by the alias that produced the original mistake.
+
+**Resolution creates nothing.** It never inserts a canonical entity and never writes a mapping — a read cannot have a write as a side effect. Persistence is `ExternalIdStore`'s job.
+
+The alias fallback passes `team_aliases.created_at` through `fn_visible_at` with a NULL supersede time rather than writing `created_at <= cutoff`. Aliases are never superseded, so the predicate is trivial — which is exactly when hand-writing it starts (§2.2).
+
+## 17.3 Writing a decision, and refusing to
+
+`ExternalIdStore.ensure` is the **automatic** path and is *incapable* of changing an existing mapping. Absent → insert. Same target → unchanged. **Different target → `CONFLICT`: nothing is written and a review item is filed.** That is §6 rule 9, "never auto-remap", expressed as a method that cannot do the wrong thing rather than as a rule someone must remember.
+
+`supersede_and_remap` is the **deliberate** path, for when a person has decided. It closes the old revision and opens a new one **at one shared instant** — the old row's `superseded_at` equals the new row's `known_at` — so exactly one revision is visible at every cutoff. It holds to the P0-06 grants: `INSERT`, plus `UPDATE` of `superseded_at` alone. `internal_id` is never rewritten; the trigger rejects it, and the test suite exercises that from this side.
+
+**Overlapping revisions resolve to `Ambiguous`, not to a guess.** If a history genuinely says two things at one instant, saying so is the correct answer.
+
+## 17.4 The review queue, populated only by real cases
+
+`entity_review_queue` gets a row for a genuine ambiguity, a genuine unknown, or a genuine conflict — and for nothing else. **No demonstration rows.** Insertion is guarded by `WHERE NOT EXISTS (… status = 'open')`, so a second run of the same unresolved case adds nothing.
+
+For the clean E0 2023/24 dataset the queue stays **empty**, which is why `db:verify-external-ids` check 28e still holds.
+
+## 17.5 Meeting identity — the reusable hook
+
+`engine.ingestion.meetings` decides only what the data decides:
+
+- the ordered pairing occurs **once** in the scope → the meeting is identified, with the neutral ordinals `stage='regular'`, `leg=1`, `replay_number=0`;
+- the pairing occurs **more than once** → **`RepeatedPairing`. Refuse.**
+
+The refusal type carries no stage, leg or replay field, so a caller cannot read an ordinal off it even by accident. Verified against the real SC0 2023/24 file, where the same ordered pairing occurs two and three times (§16.1).
+
+**No database and no provider.** The rule is about competition format, so the import job now asks this module instead of counting pairings itself — the same single-place discipline §11.1 applies to the visibility predicate. Generalised multi-round stage logic is **not** built here: a provider that supplies a round or matchday can pass the ordinal explicitly, and that is a provider capability, not something this module may infer.
+
+## 17.6 The run
+
+```
+uv run python -m engine.jobs.resolve_identities --division E0 --season 2324
+```
+
+**Reads the database; downloads nothing.** Every provider string it needs is already stored — P0-11 wrote the team spellings into `team_aliases`, and the division and season codes come from the catalogue. Competition and season are *declared* (the catalogue states what `E0` means, and the canonical row is looked up by that slug; if it is absent the run files a review item and creates nothing). Teams are *resolved*.
+
+Verified on the imported E0 2023/24 data:
+
+```
+20/20 teams resolved · competition E0 mapped · season 2324/E0 mapped
+external_ids 22 current, 0 superseded · entity_review_queue 0
+second run: 0 created, 22 unchanged, 0 conflicts, 0 review items
+380 fixtures, results, stats and 9,284 odds ticks unchanged
+```
+
+## 17.7 Limitations, recorded
+
+`confidence` is left **NULL**: every mapping here is an exact match or a declaration, and inventing a number would be the threshold §11.5 forbids. `last_verified_at` is likewise untouched — the re-verification job that owns it is Phase 1 (§G).
+
+`fixture_match_candidates` (§11.6) is **not built**. It is cross-provider duplicate scoring, and Phase 0 has one provider; there is nothing to score against. The meeting hook is the deterministic part of that problem, and it is the part that has a real caller today.
+
+**Repeated pairings remain unimportable.** Scotland, Wales and Northern Ireland need a meeting ordinal the source does not supply, and the hook refuses rather than manufacture one.
+
+---
+
 # A. Final architecture
 
 Unchanged from `ARCHITECTURE.md` in shape — three deployables, database as the engine↔app interface, one scoreline matrix deriving all markets. Four amendments:
@@ -1918,7 +2012,7 @@ Unchanged from `ARCHITECTURE.md` in shape — three deployables, database as the
 
 **Evaluation** — `prediction_outcomes` (bitemporal), `model_performance`.
 
-**Review queues** — `entity_review_queue` (table created in **P0-06**, §11.2; populated by P0-12), `fixture_match_candidates` (**P0-12**, §11.6).
+**Review queues** — `entity_review_queue` (table created in **P0-06**, §11.2; populated by P0-12), `fixture_match_candidates` (**P0-12**, §11.6). — **[SUPERSEDED 2026-09-09]** `fixture_match_candidates` was **not built**: it scores cross-provider duplicates and Phase 0 has one provider (§17.7). The deterministic half of that problem — refusing a repeated ordered pairing rather than manufacturing a meeting ordinal — ships as `engine.ingestion.meetings` (§17.5).
 
 **Application** — deferred entirely to Phase 5. Not built in Phase 0.
 
@@ -1941,7 +2035,7 @@ Championship 2023/24 · consensus ground truth with manual adjudication of disag
 | **P0-09** | Odds model: `bookmakers`, `odds_series`, `odds_ticks` — *`odds_coverage` deferred (§14.9)* | 04, 06, 07 — *[CORRECTED 2026-09-08]* previously `04, 07`, which omitted `fn_visible_at` |
 | **P0-10** | `ProviderAdapter` interface + canonical DTOs + an adapter contract test suite any adapter must pass — *implemented as **application-layer Python only**: no table, no column, no migration (§15)* | 04 — *its DTOs also mirror the canonical shapes of 05, 07, 08 and 09, though it writes none of them* |
 | **P0-11** | Adapter #1 — football-data.co.uk CSV (results **and** odds; free, no key, exercises the whole pipeline) — *delivered 2026-09-08 including **match statistics**, which the provider does supply (§16.5); odds limited to the documented closing columns* | 04, 06, 07, 08, 09, 10 |
-| **P0-12** | Entity resolution: alias matching, fuzzy candidates, **`fixture_match_candidates`** (§11.6), review queue population, and the semantics of `confidence` (§11.5) | 06, 11 |
+| **P0-12** | Entity resolution: exact alias matching, review queue population, and the deterministic meeting hook — *delivered 2026-09-09 (§17). **No fuzzy candidates and no `fixture_match_candidates`**: Phase 0 has one provider, so there is nothing to score against, and `confidence` stays NULL rather than inventing the threshold §11.5 forbids* | 06, 11 |
 | **P0-13** | Historical import: 3 leagues × 5 seasons of results and odds, with full provenance | 08, 09, 12 |
 | **P0-14** | Validation and reconciliation suite: data-quality assertions + cross-source reconciliation | 13 |
 | **P0-15** | Reproducibility harness: `dataset_snapshots`, `model_versions`, `training_runs`, `feature_snapshots`, `reproduce.py` with **L1 and L2 against a placeholder model** | 08 |
@@ -1966,7 +2060,7 @@ Phase 0 ends at P0-18, not P0-17. **The waiting period is part of the plan** —
 | P0-09 | Polling an unchanged price twice writes **one** tick; a suspension writes a tick with `is_available = false`; `odds_coverage` distinguishes "not polled" from "unchanged" — **[SUPERSEDED 2026-09-08]** the first clause is **ingestion behaviour** and belongs to P0-10/P0-11 (§6 rule 15); the third depends on `odds_coverage`, which is **not built** (§14.9). **Amended criterion:** the odds layer accepts a suspension as `is_available = false` with `price IS NULL`; a duplicate 1X2 series is rejected by a `NULLS NOT DISTINCT` key; two identical prices at different instants both survive while an exact `(series, source, instant, kind)` current duplicate is rejected; a cutoff read distinguishes `known_at` from `observed_at`; `provider_closing`, `exchange_sp` and `observed` remain distinguishable and `last_observed_pre_kickoff` is derivable rather than stored; and **no derived probability, overround, fair price or coverage column exists** |
 | P0-10 | The contract test suite runs against a stub adapter and fails it for each of: provider shape leakage, missing `known_at`, absent raw payload persistence — *satisfied 2026-09-08: each defect has a deliberately broken stub and a test asserting the suite catches it (§15.12)* |
 | P0-11 | The adapter passes the contract suite; every ingested row traces to a `raw_payload_body_id`; re-running the import is idempotent (row counts unchanged) — *satisfied 2026-09-08 against the real E0 2023/24 file: 380 fixtures, schedules, results and stats plus 9,284 closing odds ticks; the second import wrote **zero** revisions, added one `raw_payloads` row and no new body* |
-| P0-12 | ≥95% of teams auto-resolve; every unresolved team appears in the review queue; **zero teams are silently auto-created** |
+| P0-12 | ≥95% of teams auto-resolve; every unresolved team appears in the review queue; **zero teams are silently auto-created** — *satisfied 2026-09-09: **20/20** E0 2023/24 teams resolved deterministically plus the competition and season, 22 current mappings, **zero** review items because nothing was unresolved, zero entities created by resolution* |
 | P0-13 | Row counts match the source CSVs; every fact row has non-null `source_id`, `raw_payload_body_id`, `known_at`; spot-check of 20 fixtures against the source is exact |
 | P0-14 | Every assertion from `ARCHITECTURE.md` §7 runs and passes; a deliberately corrupted row is caught and quarantined rather than published |
 | P0-15 | **L1 passes bit-for-bit** on the placeholder model; **L2 passes**; mutating a historical fact makes L2 fail with a clear message |

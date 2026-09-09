@@ -65,6 +65,11 @@ def clean_db() -> Any:
     """A connection whose canonical tables are emptied, then restored."""
     conn = psycopg.connect(database_url())
     wipe = [
+        # external_ids and the review queue come FIRST. The P0-06 canonical-side
+        # trigger refuses to delete a team while a mapping references it, so a
+        # database carrying P0-12 identity rows cannot be cleaned in any other
+        # order - and omitting them entirely makes teardown fail outright.
+        "external_ids", "entity_review_queue",
         "odds_ticks", "odds_series", "bookmakers", "match_stats", "match_results",
         "fixture_schedule", "fixtures", "team_aliases", "team_names", "teams",
         "seasons", "competition_names", "competitions", "venues", "countries",
