@@ -1,3 +1,7 @@
 * text=auto eol=lf
 *.png binary
 *.jpg binary
+
+# Provider fixtures are byte-exact artefacts: football-data.co.uk ships CRLF
+# and the parser tests assert it. Never normalise these.
+apps/engine/tests/providers/fixtures/*.csv -text

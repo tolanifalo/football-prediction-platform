@@ -244,6 +244,39 @@ class CanonicalResult(_Sourced):
         return self
 
 
+class CanonicalStats(_Sourced):
+    """Team statistics for a match (§13.3), as a provider supplies them.
+
+    Home/away PAIRED columns, no team_id and no is_home - the P0-08 shape.
+    Possession and xG are absent from this model on purpose: a provider that
+    does not supply them must leave the canonical columns NULL rather than
+    have a DTO field tempt someone to invent a value (§6 rule 12).
+    """
+
+    fixture: FixtureRef
+    home_shots: int | None = Field(default=None, ge=0)
+    away_shots: int | None = Field(default=None, ge=0)
+    home_shots_on_target: int | None = Field(default=None, ge=0)
+    away_shots_on_target: int | None = Field(default=None, ge=0)
+    home_corners: int | None = Field(default=None, ge=0)
+    away_corners: int | None = Field(default=None, ge=0)
+    home_fouls: int | None = Field(default=None, ge=0)
+    away_fouls: int | None = Field(default=None, ge=0)
+    home_yellow_cards: int | None = Field(default=None, ge=0)
+    away_yellow_cards: int | None = Field(default=None, ge=0)
+    home_red_cards: int | None = Field(default=None, ge=0)
+    away_red_cards: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _shots_on_target_within_shots(self) -> Self:
+        for side in ("home", "away"):
+            shots = getattr(self, f"{side}_shots")
+            on_target = getattr(self, f"{side}_shots_on_target")
+            if shots is not None and on_target is not None and on_target > shots:
+                raise ValueError(f"{side} shots_on_target cannot exceed shots")
+        return self
+
+
 class BookmakerRef(ProviderRef):
     """Whose price this is. Distinct from who supplied it (§14.2)."""
 
@@ -315,5 +348,6 @@ CanonicalRecord = (
     | CanonicalTeam
     | CanonicalFixture
     | CanonicalResult
+    | CanonicalStats
     | CanonicalOdds
 )

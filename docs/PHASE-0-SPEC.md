@@ -1691,7 +1691,7 @@ The third state is why a rate limit or an exhausted retry budget can never be mi
 
 Pydantic v2, used **here and only here**, to validate untrusted provider data at the boundary. It is not an ORM and not the persistence model; canonical writes remain explicit psycopg SQL in later phases. Models are `strict`, `frozen` and `extra="forbid"`, so a provider sending `"3"` where an integer belongs **fails rather than being coerced**.
 
-Six DTOs — the smallest set with a real producer and consumer: `CanonicalCompetition`, `CanonicalSeason`, `CanonicalTeam`, `CanonicalFixture`, `CanonicalResult`, `CanonicalOdds`. **`CanonicalVenue` and `CanonicalMatchStats` are deferred**: P0-11's source supplies neither.
+Six DTOs — the smallest set with a real producer and consumer: `CanonicalCompetition`, `CanonicalSeason`, `CanonicalTeam`, `CanonicalFixture`, `CanonicalResult`, `CanonicalOdds`. **`CanonicalVenue` and `CanonicalMatchStats` are deferred**: P0-11's source supplies neither. — **[SUPERSEDED 2026-09-08]** half of that is wrong. Verification against the live source showed football-data.co.uk **does** supply match statistics (`HS AS HST AST HF AF HC AC HY AY HR AR`), so P0-11 adds a **seventh** DTO, `CanonicalStats`, and ingests them (§16.5). It carries no possession or xG field **by design** — the provider supplies neither, and a DTO field that no source fills is an invitation to invent a value (§6 rule 12). `CanonicalVenue` remains deferred: that part still holds.
 
 **Provider IDs are not canonical IDs.** Every reference carries `provider_key` — identity *input* for the resolver, destined for `external_ids` and nowhere else. **No field is named `id`**, so a repository cannot mistake a provider string for a canonical UUID.
 
@@ -1801,6 +1801,98 @@ Two runtime dependencies added and no others: **`httpx`** and **`pydantic`**. No
 
 ---
 
+# 16. First real provider — football-data.co.uk (P0-11)
+
+The first vertical slice: a real historical dataset, through the P0-10 boundary, into the canonical database. Application-layer only — **no table, no column, no migration.**
+
+## 16.1 Provider facts, verified against the live source
+
+`www.football-data.co.uk` returns **HTTP 503**; the **apex host works**. Base URL is `https://football-data.co.uk`, files at `/mmz4281/{season}/{division}.csv`.
+
+| | Verified 2026-09-08 |
+|---|---|
+| Format | Comma-separated CSV, **CRLF**, no API |
+| Encoding | ASCII in every file sampled, **but the 2025/26 file carries a UTF-8 BOM** (`EF BB BF` before `Div`) — decoded with `utf-8-sig` |
+| Dates | `dd/mm/yy` up to ~2017/18, **`dd/mm/yyyy` from ~2018/19** |
+| Time | Present from ~2019/20; **UK local for every league** — Spanish slots appear one hour behind CET. An inference, not provider documentation |
+| Schema drift | E0 column count 28 (93/94) → 68 → 62 → 106 (20/21) → 120 → **132 (25/26)**; counts differ *between divisions in one season* (E0 106, SP1 105, EC 98) |
+| Odds | notes.txt: *"These are for **pre-closing** odds. For the closing odds, as below but with an additional 'C' … (e.g. B365CH = closing Bet365 home win odds)."* |
+| Asian handicap | *"AHh = Market size of handicap (**home team**)"* — exactly G8's rule |
+| Max/Avg | *"Market maximum / average"* — cross-bookmaker aggregates |
+| Statistics | **`HS AS HST AST HF AF HC AC HY AY HR AR` are supplied**, plus `Referee` and (older seasons) `Attendance` |
+| Uniqueness | E0 2023/24: each ordered pairing occurs exactly once. **SC0 2023/24: the same ordered pairing occurs 2–3 times** |
+
+**Not supplied:** xG · possession · venues · players · injuries · weather · odds timestamps · competition names · round numbers · fixture identifiers · **any postponed or abandoned row** — the archive contains only played matches, so a cancelled match is simply absent and a replayed one appears once, on its final date.
+
+## 16.2 The adapter
+
+`provider_slug = "football-data-couk"`, `adapter_version = "football-data-couk@1.0.0"`.
+
+**File-based, modelled honestly.** One `FetchRequest` (`scope = {division, season}`) maps to one file and one `FetchResult` with `next_cursor=None, complete=True`, and **`supports_pagination = False`** — the P0-10 envelope already expresses "one page, done" without a fabricated cursor. A download failure returns `complete=False`, which cannot read as success.
+
+Parsing is **column-name driven** through stdlib `csv.DictReader`; an unknown column is ignored and survives only in raw evidence, so the provider adding a column never fails an import. **No pandas.**
+
+`catalog.py` holds everything that is **ours, not the provider's**: `E0` → Premier League, the country, tier, `local_tz`, the bookmaker column prefixes, and the season-label shape. The CSV says `Div = E0` and nothing more.
+
+## 16.3 Canonical mapping
+
+| Provider | Canonical | Note |
+|---|---|---|
+| `Div` | competition | via the project catalogue |
+| season folder | season label | `2324` → `2023/24`, `start_year` 2023 |
+| `HomeTeam`/`AwayTeam` | `TeamRef` | verbatim; matching is P0-12 |
+| `Date` + `Time` | `kickoff_utc`, `local_date`, `local_tz` | UK local → UTC; both date formats |
+| — | `status` | **always `ft`** |
+| `FTHG/FTAG`, `HTHG/HTAG` | `match_results` | `result_source='played'`, `is_trainable=true` |
+| `FTR`/`HTR` | *ignored* | derivable from the scores |
+| `HS…AR` | `match_stats` | 12 columns; **possession and xG stay NULL** |
+| `*C*` closing columns | `odds_series` + `odds_ticks` | see §16.5 |
+| `Max*`, `Avg*`, `Bb*` | **excluded** | cross-bookmaker aggregates with no bookmaker (§14.2) |
+| non-`C` pre-closing columns | **not ingested** | see §16.5 |
+| `Referee`, `Attendance` | not ingested | no canonical home |
+
+## 16.4 Identity
+
+`stage='regular'`, `leg=1`, `replay_number=0`. **Before insertion the job verifies that every ordered pairing occurs exactly once and refuses the import if it does not** — the generalised meeting-ordinal rule that Scotland needs is a broader identity problem and belongs with P0-12.
+
+**Twenty teams are declared by hand** in `seed.py`, each with the provider's exact spelling as a `team_aliases` row. Resolution is **exact alias match only**. An unmapped string yields no guess and no silently created team: the run reports `partial` and lists it. *"Ath Madrid" and "Ath Bilbao" are why.*
+
+## 16.5 Odds and statistics
+
+**Only the documented `C` columns are ingested**, as `price_kind='provider_closing'` with the convention recorded on every tick: *the provider declares these closing but supplies no timestamp; `observed_at` is the fixture kickoff instant.* `provider_at` is NULL — the source has none.
+
+**The non-`C` columns are documented as "pre-closing", not "opening".** Calling them `provider_opening` would assert something the provider does not, and `observed` would claim we polled them. They stay in raw evidence until a `provider_prematch` value is approved. Bookmakers: `kind='bookmaker'`, `commission_rate` NULL, `side='back'`. No exchange in this slice; no `exchange_sp`; no lay.
+
+Markets: `1x2` (line NULL), `over_under` (line 2.50), `asian_handicap` (the provider's home-perspective `AHCh`). An empty cell produces **no tick** — never a zero.
+
+**Statistics are ingested** (ruling, 2026-09-08). Possession and xG are left NULL because the provider supplies neither, and the DTO has no field for them so nobody can invent one.
+
+## 16.6 Persistence, transactions, idempotency
+
+Explicit psycopg SQL, no ORM. Order: job run → **evidence, committed before a single row is parsed** → reference data → **one transaction per fixture** (fixture + schedule + result + stats + series + ticks). A failing fixture rolls back that fixture alone; raw evidence never rolls back.
+
+The run's HTTP counters are recorded by the **job**, not the adapter: the adapter exposes the transport's answer and owns no `IngestionStats`, because the counters belong to the run. A timeout produces no response and therefore no `raw_payloads` row, so it is counted there or it is invisible.
+
+Each writer compares content first and writes a revision **only when a fact actually differs**. Verified on the real dataset: a second import of the same file wrote **0 schedules, 0 results, 0 stats, 0 ticks**, left every canonical count unchanged, added **one** `raw_payloads` row and **no** `raw_payload_bodies` row.
+
+## 16.7 The first dataset, imported
+
+`https://football-data.co.uk/mmz4281/2324/E0.csv` — Premier League 2023/24, 380 matches.
+
+```
+countries 1 · competitions 1 · seasons 1 · teams 20 · team_aliases 20 · bookmakers 6
+fixtures 380 · fixture_schedule 380 · match_results 380 · match_stats 380
+odds_series 9,284 · odds_ticks 9,284
+raw_payloads 1 · raw_payload_bodies 1 (172,196 bytes, sha256 verified)
+job_runs 1 — status ok, 1 request, HTTP 200, 380 parsed, 380 accepted, 0 rejected, 760 identities resolved, 0 unknown
+```
+
+## 16.8 Limitations, recorded
+
+Postponed and abandoned fixtures are **absent from the source**, so every ingested fixture is `ft`/`played` and absence is uninterpretable. No awarded results can be expressed. Kickoff times before ~2019/20 are unavailable and default to local midnight. The UK-local time convention is an inference. Multi-round leagues (Scotland, Wales, Northern Ireland) are **not importable** until the meeting-ordinal question is settled.
+
+---
+
 # A. Final architecture
 
 Unchanged from `ARCHITECTURE.md` in shape — three deployables, database as the engine↔app interface, one scoreline matrix deriving all markets. Four amendments:
@@ -1848,7 +1940,7 @@ Championship 2023/24 · consensus ground truth with manual adjudication of disag
 | **P0-08** | Bitemporal facts: `match_results`, `match_stats`, and **column-level grants**. **Consumes** the as-of mechanism built in P0-06 — *[CORRECTED 2026-09-08]* this row previously claimed ownership of the `as_of` SQL function; see §11.1 | 04, 06, 07 — *[CORRECTED 2026-09-08]* previously `04, 07`, which omitted `fn_visible_at`; see §13.1 |
 | **P0-09** | Odds model: `bookmakers`, `odds_series`, `odds_ticks` — *`odds_coverage` deferred (§14.9)* | 04, 06, 07 — *[CORRECTED 2026-09-08]* previously `04, 07`, which omitted `fn_visible_at` |
 | **P0-10** | `ProviderAdapter` interface + canonical DTOs + an adapter contract test suite any adapter must pass — *implemented as **application-layer Python only**: no table, no column, no migration (§15)* | 04 — *its DTOs also mirror the canonical shapes of 05, 07, 08 and 09, though it writes none of them* |
-| **P0-11** | Adapter #1 — football-data.co.uk CSV (results **and** odds; free, no key, exercises the whole pipeline) | 10 |
+| **P0-11** | Adapter #1 — football-data.co.uk CSV (results **and** odds; free, no key, exercises the whole pipeline) — *delivered 2026-09-08 including **match statistics**, which the provider does supply (§16.5); odds limited to the documented closing columns* | 04, 06, 07, 08, 09, 10 |
 | **P0-12** | Entity resolution: alias matching, fuzzy candidates, **`fixture_match_candidates`** (§11.6), review queue population, and the semantics of `confidence` (§11.5) | 06, 11 |
 | **P0-13** | Historical import: 3 leagues × 5 seasons of results and odds, with full provenance | 08, 09, 12 |
 | **P0-14** | Validation and reconciliation suite: data-quality assertions + cross-source reconciliation | 13 |
@@ -1873,7 +1965,7 @@ Phase 0 ends at P0-18, not P0-17. **The waiting period is part of the plan** —
 | P0-08 | **The §2.3 worked example passes as an automated test** — insert 2–1, insert the 2–2 correction, and assert the as-of query at T2 returns 2–1 while the current query returns 2–2. An `UPDATE` on a score column is **rejected by the database** for `engine_rw` |
 | P0-09 | Polling an unchanged price twice writes **one** tick; a suspension writes a tick with `is_available = false`; `odds_coverage` distinguishes "not polled" from "unchanged" — **[SUPERSEDED 2026-09-08]** the first clause is **ingestion behaviour** and belongs to P0-10/P0-11 (§6 rule 15); the third depends on `odds_coverage`, which is **not built** (§14.9). **Amended criterion:** the odds layer accepts a suspension as `is_available = false` with `price IS NULL`; a duplicate 1X2 series is rejected by a `NULLS NOT DISTINCT` key; two identical prices at different instants both survive while an exact `(series, source, instant, kind)` current duplicate is rejected; a cutoff read distinguishes `known_at` from `observed_at`; `provider_closing`, `exchange_sp` and `observed` remain distinguishable and `last_observed_pre_kickoff` is derivable rather than stored; and **no derived probability, overround, fair price or coverage column exists** |
 | P0-10 | The contract test suite runs against a stub adapter and fails it for each of: provider shape leakage, missing `known_at`, absent raw payload persistence — *satisfied 2026-09-08: each defect has a deliberately broken stub and a test asserting the suite catches it (§15.12)* |
-| P0-11 | The adapter passes the contract suite; every ingested row traces to a `raw_payload_body_id`; re-running the import is idempotent (row counts unchanged) |
+| P0-11 | The adapter passes the contract suite; every ingested row traces to a `raw_payload_body_id`; re-running the import is idempotent (row counts unchanged) — *satisfied 2026-09-08 against the real E0 2023/24 file: 380 fixtures, schedules, results and stats plus 9,284 closing odds ticks; the second import wrote **zero** revisions, added one `raw_payloads` row and no new body* |
 | P0-12 | ≥95% of teams auto-resolve; every unresolved team appears in the review queue; **zero teams are silently auto-created** |
 | P0-13 | Row counts match the source CSVs; every fact row has non-null `source_id`, `raw_payload_body_id`, `known_at`; spot-check of 20 fixtures against the source is exact |
 | P0-14 | Every assertion from `ARCHITECTURE.md` §7 runs and passes; a deliberately corrupted row is caught and quarantined rather than published |

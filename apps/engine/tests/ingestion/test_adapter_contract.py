@@ -249,8 +249,15 @@ class TestAdapterIsolation:
         root = pathlib.Path(__file__).resolve().parents[2]
         package = root / "src" / "engine" / "ingestion"
         banned_roots = {"psycopg", "sqlalchemy", "asyncpg"}
+        # postgres.py IS the database implementation of the RawArchive,
+        # JobRunStore and CanonicalWriter ports, added by P0-11. It is the one
+        # module here that is meant to import psycopg; the ban covers every
+        # other. The boundary that protects PROVIDERS is asserted separately,
+        # over engine/providers, which may import none of this.
         offenders: list[str] = []
         for path in sorted(package.glob("*.py")):
+            if path.name == "postgres.py":
+                continue
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in ast.walk(tree):
                 names: list[str] = []
