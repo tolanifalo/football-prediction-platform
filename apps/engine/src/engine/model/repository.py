@@ -33,6 +33,7 @@ provider does supply it.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -122,3 +123,80 @@ def load_observations(
         season_labels=[season_label],
         as_of=as_of,
     )
+
+
+#: Fixtures eligible for prediction: those that had NOT kicked off by the
+#: cutoff. Strictly at-or-after, because a match kicking off exactly at the
+#: cutoff has not been played and is therefore still predictable.
+#:
+#: The result table is NOT joined. A fixture is eligible because of when it is
+#: scheduled, never because of whether we happen to know its score - joining
+#: results here is how a prediction pipeline quietly starts requiring the
+#: answer before it will produce a question.
+_ELIGIBLE = """
+SELECT f.id,
+       hn.name AS home_team,
+       an.name AS away_team,
+       s.kickoff_utc,
+       se.label AS season
+  FROM fixtures f
+  JOIN fixture_schedule_as_of(%(as_of)s) s ON s.fixture_id = f.id
+  JOIN seasons se ON se.id = f.season_id
+  JOIN competitions c ON c.id = se.competition_id
+  JOIN team_names hn ON hn.team_id = f.home_team_id AND hn.valid_to IS NULL
+  JOIN team_names an ON an.team_id = f.away_team_id AND an.valid_to IS NULL
+ WHERE c.slug = %(competition)s
+   AND s.kickoff_utc >= %(cutoff)s
+   AND (%(seasons)s::text[] IS NULL OR se.label = ANY(%(seasons)s))
+ ORDER BY s.kickoff_utc, hn.name, an.name
+"""
+
+
+@dataclass(frozen=True)
+class EligibleFixture:
+    """A fixture awaiting prediction at a given cutoff."""
+
+    fixture_id: str
+    home_team: str
+    away_team: str
+    kickoff: datetime
+    season: str
+
+
+def load_eligible_fixtures(
+    conn: psycopg.Connection[Any],
+    *,
+    competition_slug: str,
+    data_cutoff: datetime,
+    as_of: datetime,
+    season_labels: Sequence[str] | None = None,
+) -> list[EligibleFixture]:
+    """Fixtures kicking off at or after `data_cutoff`, as known at `as_of`.
+
+    Both axes again, and both required. `as_of` picks the SCHEDULE revision we
+    believe; `data_cutoff` decides which fixtures are still in the future. A
+    rescheduled match legitimately becomes eligible or ineligible depending on
+    which revision of its schedule is being read.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            _ELIGIBLE,
+            {
+                "as_of": as_of,
+                "competition": competition_slug,
+                "cutoff": data_cutoff,
+                "seasons": list(season_labels) if season_labels else None,
+            },
+        )
+        rows: Sequence[tuple[Any, ...]] = cur.fetchall()
+
+    return [
+        EligibleFixture(
+            fixture_id=str(row[0]),
+            home_team=str(row[1]),
+            away_team=str(row[2]),
+            kickoff=row[3],
+            season=str(row[4]),
+        )
+        for row in rows
+    ]

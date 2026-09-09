@@ -469,7 +469,12 @@ try {
   const [wrapCount] = await sql<{ n: number }[]>`
     SELECT count(*)::int AS n FROM pg_proc p JOIN pg_namespace n2 ON n2.oid = p.pronamespace
      WHERE n2.nspname = 'public' AND p.proname LIKE '%\\_as\\_of'`;
-  check("67. five as-of wrappers now exist", wrapCount?.n === 5, `${wrapCount?.n}`);
+  // Five when P0-09 wrote this; six since P1-01 added predictions_as_of.
+  // The count is asserted rather than a lower bound because a NEW
+  // wrapper is exactly the event that must be noticed: each one is a
+  // place the visibility predicate could be restated, and check 64 is
+  // what proves none of them does.
+  check("67. six as-of wrappers now exist", wrapCount?.n === 6, `${wrapCount?.n}`);
   const selfSrc = readFileSync(new URL(import.meta.url), "utf8");
   const restatements = selfSrc.split(PREDICATE).length - 1;
   check("68. this verification file restates the predicate ZERO times", restatements === 0, `${restatements}`);
@@ -617,11 +622,17 @@ try {
   }
 
   // =====================================================================
-  console.log("\n  boundaries — P0-10+ not started, coverage deferred (G13):");
+  console.log("\n  boundaries — coverage deferred (G13), value engine unbuilt:");
+  // `predictions` left this list when P1-01 built it by approved design
+  // (PREDICTIONS.md). Everything still on it is genuinely absent:
+  // coverage is deferred, value_signals and market_consensus await a
+  // value engine that does not exist, model_versions was rejected in
+  // favour of serialisable fit metadata, and there is deliberately no
+  // per-market prediction table - the scoreline matrix is the artifact.
   const [beyond] = await sql<{ t: string | null }[]>`
     SELECT string_agg(tablename, ',') AS t FROM pg_tables WHERE schemaname = 'public'
        AND tablename IN ('odds_coverage','odds_poll_windows','market_consensus','value_signals',
-                         'match_events','predictions','prediction_markets','prediction_outcomes',
+                         'match_events','prediction_markets','prediction_outcomes',
                          'team_ratings','standings','fixture_match_candidates','competition_coverage',
                          'model_versions','feature_snapshots','odds_snapshots')`;
   check("86. no coverage, value, prediction or P0-10+ table exists", beyond?.t === null, beyond?.t ?? "");

@@ -66,6 +66,10 @@ def clean_db() -> Any:
     """A connection whose canonical tables are emptied, then restored."""
     conn = psycopg.connect(database_url())
     wipe = [
+        # predictions reference fixtures AND job_runs, so they go before
+        # both. Omitting them makes teardown fail outright once a prediction
+        # exists - the same way omitting external_ids did.
+        "predictions",
         # external_ids and the review queue come FIRST. The P0-06 canonical-side
         # trigger refuses to delete a team while a mapping references it, so a
         # database carrying P0-12 identity rows cannot be cleaned in any other

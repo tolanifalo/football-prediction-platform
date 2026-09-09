@@ -38,6 +38,7 @@ from engine.ingestion.identity import (
 from engine.ingestion.runs import RunIdentity, RunStatus
 from engine.ingestion.signatures import body_hash
 from engine.ingestion.stats import IngestionStats
+from engine.model.artifact import PERSISTED_LINES, PredictionArtifact
 
 _BODY_UPSERT = """
 INSERT INTO raw_payload_bodies (hash_algo, body_hash, body, byte_size)
@@ -837,3 +838,134 @@ class ExternalIdStore:
                 ),
             )
             return cur.fetchone() is not None
+
+
+# ===========================================================================
+# P1-01: prediction persistence (PREDICTIONS.md)
+# ===========================================================================
+# The same shape as every other revisioned writer here: compare content first,
+# write a revision ONLY when something actually differs. A rerun of the same
+# (fixture, model, cutoff) with the same underlying data writes nothing at all.
+
+#: The columns that decide whether a rerun changed anything. `known_at` is
+#: excluded on purpose - regenerating the same prediction tomorrow is the same
+#: prediction, and including the timestamp would make every rerun a revision.
+_PREDICTION_CURRENT = """
+SELECT id, lambda_home, lambda_away, max_goals, scoreline, truncated_mass,
+       p_home, p_draw, p_away, p_over_0_5, p_over_1_5, p_over_2_5, p_over_3_5,
+       p_btts_yes, is_cold_start, cold_started_teams, training_matches
+  FROM predictions
+ WHERE fixture_id = %s AND model_version = %s AND profile = %s
+   AND data_cutoff = %s AND superseded_at IS NULL
+"""
+
+_PREDICTION_SUPERSEDE = """
+UPDATE predictions SET superseded_at = %s
+ WHERE id = %s AND superseded_at IS NULL
+"""
+
+_PREDICTION_INSERT = """
+INSERT INTO predictions
+  (fixture_id, model_family, model_version, profile, data_cutoff, known_at,
+   lambda_home, lambda_away, max_goals, scoreline, truncated_mass,
+   p_home, p_draw, p_away, p_over_0_5, p_over_1_5, p_over_2_5, p_over_3_5,
+   p_btts_yes, is_cold_start, cold_started_teams, training_matches,
+   fit_metadata, job_run_id)
+VALUES (%s, %s, %s, %s, %s, %s,
+        %s, %s, %s, %s, %s,
+        %s, %s, %s, %s, %s, %s, %s,
+        %s, %s, %s, %s,
+        %s, %s)
+RETURNING id
+"""
+
+
+class PredictionOutcome(StrEnum):
+    """What a call to `store` actually did."""
+
+    CREATED = "created"
+    #: The same prediction already existed. Nothing was written.
+    UNCHANGED = "unchanged"
+    #: Same identity, different numbers - the old row was superseded first.
+    REVISED = "revised"
+
+
+class PostgresPredictionStore:
+    """Persists prediction artifacts, and refuses to overwrite one.
+
+    There is no "latest" column and no in-place update of a probability. A
+    regenerated prediction whose numbers differ - because a result underneath
+    its cutoff was revised - closes the old revision and opens a new one, so
+    what we predicted at the time stays readable at its own cutoff forever.
+    """
+
+    def __init__(
+        self, conn: psycopg.Connection[Any], *, job_run_id: int | None = None
+    ) -> None:
+        self._conn = conn
+        self._job_run_id = job_run_id
+
+    def _comparable(self, artifact: PredictionArtifact) -> tuple[Any, ...]:
+        return (
+            artifact.lambda_home,
+            artifact.lambda_away,
+            artifact.max_goals,
+            list(artifact.scoreline),
+            artifact.truncated_mass,
+            artifact.p_home,
+            artifact.p_draw,
+            artifact.p_away,
+            *(artifact.p_over[line] for line in PERSISTED_LINES),
+            artifact.p_btts_yes,
+            artifact.is_cold_start,
+            list(artifact.cold_started_teams),
+            artifact.training_matches,
+        )
+
+    def store(self, artifact: PredictionArtifact) -> PredictionOutcome:
+        """Persist one prediction. Validates before it touches the database."""
+        artifact.validate()
+        fixture_id, model_version, profile, data_cutoff = artifact.identity
+
+        with self._conn.cursor() as cur:
+            cur.execute(
+                _PREDICTION_CURRENT,
+                (fixture_id, model_version, profile, data_cutoff),
+            )
+            current = cur.fetchone()
+            outcome = PredictionOutcome.CREATED
+            if current is not None:
+                if tuple(current[1:]) == self._comparable(artifact):
+                    return PredictionOutcome.UNCHANGED
+                cur.execute(
+                    _PREDICTION_SUPERSEDE, (artifact.known_at, current[0])
+                )
+                outcome = PredictionOutcome.REVISED
+
+            cur.execute(
+                _PREDICTION_INSERT,
+                (
+                    fixture_id,
+                    artifact.model_family,
+                    model_version,
+                    profile,
+                    data_cutoff,
+                    artifact.known_at,
+                    artifact.lambda_home,
+                    artifact.lambda_away,
+                    artifact.max_goals,
+                    list(artifact.scoreline),
+                    artifact.truncated_mass,
+                    artifact.p_home,
+                    artifact.p_draw,
+                    artifact.p_away,
+                    *(artifact.p_over[line] for line in PERSISTED_LINES),
+                    artifact.p_btts_yes,
+                    artifact.is_cold_start,
+                    list(artifact.cold_started_teams),
+                    artifact.training_matches,
+                    Jsonb(artifact.fit_metadata),
+                    self._job_run_id,
+                ),
+            )
+        return outcome

@@ -594,11 +594,16 @@ try {
     SELECT string_agg(tablename, ',') AS t FROM pg_tables
      WHERE schemaname = 'public'
        AND tablename IN ('match_events','odds_coverage','odds_poll_windows','market_consensus',
-                         'value_signals','predictions','prediction_markets','prediction_outcomes',
+                         'value_signals','prediction_markets','prediction_outcomes',
                          'team_ratings','standings','fixture_match_candidates','competition_coverage')`;
   // bookmakers/odds_series/odds_ticks were on this list until P0-09 landed and
-  // created them by approved design; the boundary this check defends is now
-  // P0-10+. odds_coverage stays forbidden - it is deferred, not built (§14.9).
+  // created them by approved design; `predictions` came off it when P1-01
+  // built it, likewise by approved design (PREDICTIONS.md). What the check
+  // still defends is real: odds_coverage is deferred not built (§14.9), value
+  // signals belong to a value engine that does not exist, and there is
+  // deliberately NO per-market prediction table - the scoreline matrix is the
+  // artifact and prediction_markets/prediction_outcomes would let two rows
+  // disagree about one match.
   check("72. none of the P0-10+ tables exist", beyond?.t === null, beyond?.t ?? "");
   const [trg] = await sql<{ n: number }[]>`
     SELECT count(*)::int AS n FROM pg_trigger
