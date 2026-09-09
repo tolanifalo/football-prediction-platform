@@ -16,6 +16,7 @@ import math
 from dataclasses import dataclass
 from datetime import datetime
 
+from engine.model.dixon_coles import apply_correction
 from engine.model.fit import FittedModel
 from engine.model.poisson import (
     MAX_GOALS,
@@ -38,6 +39,8 @@ class Prediction:
     model_version: str
     data_cutoff: datetime
     training_matches: int
+    #: The Dixon-Coles parameter actually applied, or None for plain Poisson.
+    rho: float | None
     #: Teams that fell back to league average, if any.
     cold_started: tuple[str, ...]
 
@@ -50,6 +53,7 @@ class Prediction:
             "model_version": self.model_version,
             "data_cutoff": self.data_cutoff.isoformat(),
             "training_matches": self.training_matches,
+            "rho": self.rho,
             "home_team": self.home_team,
             "away_team": self.away_team,
             "lambda_home": self.lambda_home,
@@ -97,6 +101,11 @@ def predict_fixture(
         raise ValueError("a team cannot play itself")
     lambda_home, lambda_away = expected_goals(model, home_team, away_team)
     matrix = scoreline_matrix(lambda_home, lambda_away, max_goals)
+    # EXPERIMENTAL. `rho` is None unless the fit estimated one, and
+    # `apply_correction` returns the matrix untouched at rho == 0, so the
+    # frozen baseline's path through here is unchanged.
+    if model.rho is not None:
+        matrix = apply_correction(matrix, model.rho)
     cold = tuple(
         team
         for team in (home_team, away_team)
@@ -112,5 +121,6 @@ def predict_fixture(
         model_version=model.model_version,
         data_cutoff=model.data_cutoff,
         training_matches=model.training_matches,
+        rho=model.rho,
         cold_started=cold,
     )

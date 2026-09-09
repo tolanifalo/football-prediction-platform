@@ -13,6 +13,14 @@ from engine.model.backtest import (
     ScoredPrediction,
     walk_forward,
 )
+from engine.model.decay import DecayConfig, weights_for
+from engine.model.dixon_coles import (
+    InvalidRho,
+    apply_correction,
+    estimate_rho,
+    feasible_rho,
+    tau,
+)
 from engine.model.fit import (
     MODEL_VERSION,
     FitConfig,
@@ -42,25 +50,30 @@ from engine.model.poisson import (
 from engine.model.predict import Prediction, expected_goals, predict_fixture
 
 __all__ = [
-    "MAX_GOALS",
-    "MODEL_VERSION",
-    "OUTCOMES",
     "BacktestConfig",
     "BacktestReport",
     "CalibrationRow",
+    "DecayConfig",
     "FitConfig",
     "FittedModel",
     "InsufficientHistory",
+    "InvalidRho",
+    "MAX_GOALS",
+    "MODEL_VERSION",
     "MarketProbabilities",
     "MatchObservation",
+    "OUTCOMES",
     "Prediction",
     "ScoredPrediction",
     "ScorelineMatrix",
     "TeamRating",
+    "apply_correction",
     "brier_score",
     "calibration",
     "derive_markets",
+    "estimate_rho",
     "expected_goals",
+    "feasible_rho",
     "fit_poisson",
     "log_loss",
     "observations_before",
@@ -68,5 +81,7 @@ __all__ = [
     "poisson_pmf",
     "predict_fixture",
     "scoreline_matrix",
+    "tau",
     "walk_forward",
+    "weights_for",
 ]

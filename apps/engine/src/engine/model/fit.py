@@ -37,6 +37,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Final
 
+from engine.model.decay import DecayConfig, weights_for
+from engine.model.dixon_coles import estimate_rho
+
 MODEL_VERSION: Final[str] = "poisson-independent@1.0.0"
 
 #: Sweeps stop when no parameter moves more than this. On real league data the
@@ -82,6 +85,12 @@ class FitConfig:
     min_matches: int = DEFAULT_MIN_MATCHES
     tolerance: float = DEFAULT_TOLERANCE
     max_sweeps: int = DEFAULT_MAX_SWEEPS
+    #: EXPERIMENTAL, off by default. Recency weighting of the likelihood; the
+    #: default `None` half-life weights every match 1.0 - the frozen baseline.
+    decay: DecayConfig = field(default_factory=DecayConfig)
+    #: EXPERIMENTAL, off by default. Estimate the Dixon-Coles low-score
+    #: dependence parameter after fitting, for the predictor to apply.
+    dixon_coles: bool = False
 
     def __post_init__(self) -> None:
         if self.ridge < 0.0:
@@ -93,12 +102,14 @@ class FitConfig:
         if self.max_sweeps < 1:
             raise ValueError("max_sweeps must be at least 1")
 
-    def as_metadata(self) -> dict[str, float | int]:
+    def as_metadata(self) -> dict[str, object]:
         return {
             "ridge": self.ridge,
             "min_matches": self.min_matches,
             "tolerance": self.tolerance,
             "max_sweeps": self.max_sweeps,
+            "decay": self.decay.as_metadata(),
+            "dixon_coles": self.dixon_coles,
         }
 
 
@@ -131,6 +142,9 @@ class FittedModel:
     config: FitConfig
     log_likelihood: float
     cold_started: tuple[str, ...] = field(default=())
+    #: EXPERIMENTAL. The Dixon-Coles dependence parameter, when estimated.
+    #: `None` means the predictor applies no correction - independent Poisson.
+    rho: float | None = None
 
     def rating_for(self, team: str) -> TeamRating:
         """A team with no history at all is league average, and says so."""
@@ -153,6 +167,7 @@ class FittedModel:
             "log_likelihood": self.log_likelihood,
             "mu": self.mu,
             "home_advantage": self.home_advantage,
+            "rho": self.rho,
             "cold_started": list(self.cold_started),
             "config": self.config.as_metadata(),
             "ratings": {
@@ -219,6 +234,15 @@ def fit_poisson(
     home_goals = [o.home_goals for o in observations]
     away_goals = [o.away_goals for o in observations]
 
+    # RECENCY WEIGHTS. With decay off every entry is exactly 1.0, so each
+    # weighted sum below reduces to the unweighted one bit for bit rather
+    # than approximately - multiplying a float by 1.0 is exact in IEEE 754,
+    # and the summation order is unchanged. The frozen baseline's published
+    # numbers are asserted against that claim in the regression test.
+    weights = weights_for(observations, data_cutoff, settings.decay)
+    weighted_home = [w * g for w, g in zip(weights, home_goals, strict=True)]
+    weighted_away = [w * g for w, g in zip(weights, away_goals, strict=True)]
+
     # Matches each team appeared in, and which side it was on. Built once so a
     # coordinate update touches only that team's own matches.
     as_home: list[list[int]] = [[] for _ in range(n)]
@@ -232,9 +256,14 @@ def fit_poisson(
     if total_goals == 0:
         raise InsufficientHistory("no goals in the training window")
 
-    # Start from the league mean and no home advantage: a fixed, data-derived
-    # origin, so the fit is reproducible without a seed.
-    mu = math.log(total_goals / (2.0 * len(observations)))
+    weighted_total = sum(weighted_home) + sum(weighted_away)
+    weight_mass = sum(weights)
+    if weighted_total <= 0.0:
+        raise InsufficientHistory("no weighted goals in the training window")
+
+    # Start from the weighted league mean and no home advantage: a fixed,
+    # data-derived origin, so the fit is reproducible without a seed.
+    mu = math.log(weighted_total / (2.0 * weight_mass))
     home_advantage = 0.0
     attack = [0.0] * n
     defence = [0.0] * n
@@ -277,8 +306,10 @@ def fit_poisson(
         refresh()
 
         # -- mu: scales every lambda, so its update is exact ---------------
-        predicted = sum(lam_h) + sum(lam_a)
-        move = math.log(total_goals / predicted)
+        predicted = sum(
+            w * (h + a) for w, h, a in zip(weights, lam_h, lam_a, strict=True)
+        )
+        move = math.log(weighted_total / predicted)
         mu += move
         scale = math.exp(move)
         for m in range(len(observations)):
@@ -286,8 +317,10 @@ def fit_poisson(
             lam_a[m] *= scale
 
         # -- home advantage: exact, it scales only the home lambdas --------
-        predicted_home = sum(lam_h)
-        scored_home = sum(home_goals)
+        predicted_home = sum(
+            w * lam for w, lam in zip(weights, lam_h, strict=True)
+        )
+        scored_home = sum(weighted_home)
         if scored_home > 0 and predicted_home > 0:
             move = math.log(scored_home / predicted_home)
             home_advantage += move
@@ -297,14 +330,14 @@ def fit_poisson(
     
         # -- attack: one damped Newton step per team -----------------------
         for i in range(n):
-            scored = 0
+            scored = 0.0
             expected = 0.0
             for m in as_home[i]:
-                scored += home_goals[m]
-                expected += lam_h[m]
+                scored += weighted_home[m]
+                expected += weights[m] * lam_h[m]
             for m in as_away[i]:
-                scored += away_goals[m]
-                expected += lam_a[m]
+                scored += weighted_away[m]
+                expected += weights[m] * lam_a[m]
             gradient = scored - expected - settings.ridge * attack[i]
             curvature = -expected - settings.ridge
             if curvature == 0.0:
@@ -319,14 +352,14 @@ def fit_poisson(
 
         # -- defence: same, but it enters lambda with a minus sign ---------
         for i in range(n):
-            conceded = 0
+            conceded = 0.0
             expected = 0.0
             for m in as_home[i]:
-                conceded += away_goals[m]
-                expected += lam_a[m]
+                conceded += weighted_away[m]
+                expected += weights[m] * lam_a[m]
             for m in as_away[i]:
-                conceded += home_goals[m]
-                expected += lam_h[m]
+                conceded += weighted_home[m]
+                expected += weights[m] * lam_h[m]
             gradient = -conceded + expected - settings.ridge * defence[i]
             curvature = -expected - settings.ridge
             if curvature == 0.0:
@@ -383,6 +416,17 @@ def fit_poisson(
             cold_start=thin,
         )
 
+    # -- optional Dixon-Coles second stage ---------------------------------
+    # Estimated AFTER the Poisson parameters and holding them fixed, so the
+    # baseline estimator above is untouched by the experiment.
+    rho: float | None = None
+    if settings.dixon_coles:
+        rho = estimate_rho(
+            list(zip(lam_h, lam_a, strict=True)),
+            list(zip(home_goals, away_goals, strict=True)),
+            weights,
+        ).rho
+
     return FittedModel(
         model_version=MODEL_VERSION,
         mu=mu,
@@ -397,6 +441,7 @@ def fit_poisson(
         config=settings,
         log_likelihood=log_likelihood,
         cold_started=tuple(sorted(cold)),
+        rho=rho,
     )
 
 

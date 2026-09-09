@@ -79,6 +79,9 @@ class ScoredPrediction:
     cold_started: tuple[str, ...]
     baseline_frequency: tuple[float, float, float]
     baseline_league: tuple[float, float, float]
+    #: P(0-0), P(0-1), P(1-0), P(1-1) - the cells Dixon-Coles adjusts, kept so
+    #: the low-score diagnostic can compare candidates without refitting.
+    low_score: tuple[float, float, float, float]
 
 
 @dataclass(frozen=True)
@@ -209,6 +212,12 @@ def walk_forward(
                 cold_started=prediction.cold_started,
                 baseline_frequency=_class_frequency(training),
                 baseline_league=_league_average_probabilities(model),
+                low_score=(
+                    prediction.matrix.probability(0, 0),
+                    prediction.matrix.probability(0, 1),
+                    prediction.matrix.probability(1, 0),
+                    prediction.matrix.probability(1, 1),
+                ),
             )
         )
 
