@@ -10,6 +10,7 @@ Stack: Next.js + TypeScript + Supabase/Postgres (app) · Python (modelling) · p
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System shape, layers, API boundaries, jobs, deployment, phases. **§3 (schema) is superseded — see below.** |
 | [docs/DECISIONS-01.md](docs/DECISIONS-01.md) | ORM decision, provider evaluation framework, data-ownership analysis, v1 stress test. **§D (Phase 0 order) and the migration-mechanics rows in §1 are superseded.** |
 | [docs/PHASE-0-SPEC.md](docs/PHASE-0-SPEC.md) | **Authoritative for schema, provenance, bitemporality, odds model, reproducibility, migration harness, and the Phase 0 plan.** |
+| [docs/MODEL-BASELINE.md](docs/MODEL-BASELINE.md) | **Authoritative for the prediction engine**: Poisson formulation, data-cutoff and leakage rules, cold-start policy, scoreline truncation, backtest methodology and measured results. |
 
 Where the documents disagree, **PHASE-0-SPEC wins**. It supersedes `ARCHITECTURE.md` §3, `DECISIONS-01.md` §D, and the `tablesFilter` / drift-detection rows in `DECISIONS-01.md` §1. The superseded documents are kept as historical decision records with their original reasoning intact; obsolete statements carry an inline **`[SUPERSEDED <date>]`** marker pointing at the replacement rule. Do not delete or rewrite the historical text, and do not "fix" these documents to match without being asked.
 
