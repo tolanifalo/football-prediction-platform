@@ -307,15 +307,54 @@ class ReferenceSeeder:
         """
         return UUID(str(self._scalar(insert, (slug, name))))
 
-    def data_source(self, slug: str, name: str, kinds: Sequence[str]) -> UUID:
+    def data_source(
+        self,
+        slug: str,
+        name: str,
+        kinds: Sequence[str],
+        base_url: str = "https://football-data.co.uk",
+    ) -> UUID:
+        """Register a provider. `base_url` defaults to the first one, which
+        was hard-coded here until a second provider existed."""
         found = self._scalar("SELECT id FROM data_sources WHERE slug=%s", (slug,))
         if found:
             return UUID(str(found))
         insert = """
             INSERT INTO data_sources (slug, display_name, kinds, base_url)
-            VALUES (%s, %s, %s, 'https://football-data.co.uk') RETURNING id
+            VALUES (%s, %s, %s, %s) RETURNING id
         """
-        return UUID(str(self._scalar(insert, (slug, name, list(kinds)))))
+        params = (slug, name, list(kinds), base_url)
+        return UUID(str(self._scalar(insert, params)))
+
+    def alias_for_existing_team(
+        self, team_slug: str, alias: str, source_id: UUID
+    ) -> bool:
+        """Attach a provider spelling to a team that ALREADY exists.
+
+        Returns False when the club is not in the registry, and creates
+        nothing. That is the whole point: a new provider may name clubs we
+        have never heard of, and inventing a `teams` row for one would be the
+        silent auto-create §6 rule 9 forbids. An unrecognised club instead
+        fails to resolve and reaches the review queue.
+        """
+        team_id = self._scalar("SELECT id FROM teams WHERE slug=%s", (team_slug,))
+        if team_id is None:
+            return False
+        sql = """
+            INSERT INTO team_aliases
+              (team_id, alias, normalized_alias, source_id)
+            SELECT %s, %s, %s, %s
+             WHERE NOT EXISTS (
+               SELECT 1 FROM team_aliases
+                WHERE normalized_alias = %s
+                  AND source_id IS NOT DISTINCT FROM %s)
+        """
+        lowered = alias.strip().lower()
+        with self._conn.cursor() as cur:
+            cur.execute(
+                sql, (team_id, alias, lowered, source_id, lowered, source_id)
+            )
+        return True
 
     def alias_index(self, source_id: UUID) -> dict[str, UUID]:
         """Exact provider string -> canonical team. No fuzzy matching (P0-12)."""
