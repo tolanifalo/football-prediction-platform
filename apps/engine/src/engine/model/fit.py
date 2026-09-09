@@ -40,7 +40,12 @@ from typing import Final
 from engine.model.decay import DecayConfig, weights_for
 from engine.model.dixon_coles import estimate_rho
 
-MODEL_VERSION: Final[str] = "poisson-independent@1.0.0"
+#: The estimator's identity. UNCHANGED by the 180-day adoption: adopting a
+#: production default changed a configuration, not one line of mathematics,
+#: and bumping the version would falsely imply the model itself moved. What
+#: distinguishes production from control is recorded per fit, below.
+MODEL_FAMILY: Final[str] = "poisson-independent"
+MODEL_VERSION: Final[str] = f"{MODEL_FAMILY}@1.0.0"
 
 #: Sweeps stop when no parameter moves more than this. On real league data the
 #: fit converges in well under 100 sweeps; the cap is a guard, not a budget.
@@ -71,6 +76,10 @@ class MatchObservation:
     home_goals: int
     away_goals: int
     kickoff: datetime
+    #: Reporting only. The estimator never reads it: a season boundary is not
+    #: a modelling boundary, and training crosses it freely subject to the
+    #: cutoff. It exists so results can be grouped by season afterwards.
+    season: str = ""
 
     def __post_init__(self) -> None:
         if self.home_goals < 0 or self.away_goals < 0:
@@ -91,6 +100,9 @@ class FitConfig:
     #: EXPERIMENTAL, off by default. Estimate the Dixon-Coles low-score
     #: dependence parameter after fitting, for the predictor to apply.
     dixon_coles: bool = False
+    #: The named profile this came from, recorded so a fit says which model
+    #: produced it. Empty for an ad-hoc configuration assembled by hand.
+    profile: str = ""
 
     def __post_init__(self) -> None:
         if self.ridge < 0.0:
@@ -110,6 +122,7 @@ class FitConfig:
             "max_sweeps": self.max_sweeps,
             "decay": self.decay.as_metadata(),
             "dixon_coles": self.dixon_coles,
+            "profile": self.profile,
         }
 
 
@@ -154,9 +167,21 @@ class FittedModel:
         return found
 
     def as_metadata(self) -> dict[str, object]:
-        """Deterministic, serialisable, and enough to reproduce the fit."""
+        """Deterministic, serialisable, and enough to reproduce the fit.
+
+        The decay and cold-start settings are promoted to the top level as
+        well as appearing under `config`. They are what distinguishes the
+        production model from the control, so reading them should not require
+        knowing where the nesting put them.
+        """
         return {
+            "model_family": MODEL_FAMILY,
             "model_version": self.model_version,
+            "profile": self.config.profile,
+            "decay_enabled": self.config.decay.enabled,
+            "decay_half_life_days": self.config.decay.half_life_days,
+            "dixon_coles_enabled": self.config.dixon_coles,
+            "cold_start_min_matches": self.config.min_matches,
             "scope": self.scope,
             "data_cutoff": self.data_cutoff.isoformat(),
             "as_of": self.as_of.isoformat(),

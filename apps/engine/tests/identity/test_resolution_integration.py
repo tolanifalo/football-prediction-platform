@@ -25,12 +25,16 @@ from engine.ingestion.postgres import PostgresIdentityResolver
 from engine.ingestion.runs import RunStatus
 from engine.jobs.import_football_data import run_import
 from engine.jobs.resolve_identities import run_resolution, season_external_id
+from engine.providers.football_data_couk.seed import E0_TEAMS
 
 # Re-exported so pytest can see the fixture in this module's namespace.
 __all__ = ["clean_db"]
 
-EXPECTED_TEAMS = 20
-#: 20 teams + the E0 competition + the 2023/24 season.
+#: DERIVED FROM THE SEED, never hard-coded. The squad grew from 20 to 27 when
+#: six seasons of promotion and relegation were imported, and a literal here
+#: would have to be edited every time the corpus widens.
+EXPECTED_TEAMS = len(E0_TEAMS)
+#: every seeded team + the E0 competition + the 2023/24 season.
 EXPECTED_MAPPINGS = EXPECTED_TEAMS + 2
 
 

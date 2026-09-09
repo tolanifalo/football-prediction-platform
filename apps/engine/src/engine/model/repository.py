@@ -49,7 +49,8 @@ SELECT hn.name AS home_team,
        an.name AS away_team,
        r.ft_home,
        r.ft_away,
-       coalesce(r.occurred_at, s.kickoff_utc) AS occurred_at
+       coalesce(r.occurred_at, s.kickoff_utc) AS occurred_at,
+       se.label AS season
   FROM match_results_as_of(%(as_of)s) r
   JOIN fixtures f ON f.id = r.fixture_id
   JOIN fixture_schedule_as_of(%(as_of)s) s ON s.fixture_id = f.id
@@ -59,22 +60,26 @@ SELECT hn.name AS home_team,
   JOIN team_names an ON an.team_id = f.away_team_id AND an.valid_to IS NULL
  WHERE r.is_trainable
    AND c.slug = %(competition)s
-   AND se.label = %(season)s
+   AND se.label = ANY(%(seasons)s)
    AND coalesce(r.occurred_at, s.kickoff_utc) IS NOT NULL
  ORDER BY occurred_at, hn.name, an.name
 """
 
 
-def load_observations(
+def load_corpus(
     conn: psycopg.Connection[Any],
     *,
     competition_slug: str,
-    season_label: str,
+    season_labels: Sequence[str],
     as_of: datetime,
 ) -> list[MatchObservation]:
-    """Every trainable result in one competition-season, as of one instant.
+    """Every trainable result across one or more seasons, as of one instant.
 
-    `as_of` selects the revision, NOT the training window. Filtering to a
+    Returned in kickoff order across the WHOLE corpus, not per season: a
+    walk-forward evaluation crosses season boundaries, and a season boundary
+    is a reporting artefact rather than a modelling one.
+
+    `as_of` selects the REVISION, not the training window. Filtering to a
     training window is `observations_before`, and keeping the two apart is
     deliberate: a caller that wants a 2024 cutoff wants matches played before
     then, believed as we believe them today.
@@ -85,7 +90,7 @@ def load_observations(
             {
                 "as_of": as_of,
                 "competition": competition_slug,
-                "season": season_label,
+                "seasons": list(season_labels),
             },
         )
         rows: Sequence[tuple[Any, ...]] = cur.fetchall()
@@ -97,6 +102,23 @@ def load_observations(
             home_goals=int(row[2]),
             away_goals=int(row[3]),
             kickoff=row[4],
+            season=str(row[5]),
         )
         for row in rows
     ]
+
+
+def load_observations(
+    conn: psycopg.Connection[Any],
+    *,
+    competition_slug: str,
+    season_label: str,
+    as_of: datetime,
+) -> list[MatchObservation]:
+    """One season. The single-season form the baseline backtest uses."""
+    return load_corpus(
+        conn,
+        competition_slug=competition_slug,
+        season_labels=[season_label],
+        as_of=as_of,
+    )

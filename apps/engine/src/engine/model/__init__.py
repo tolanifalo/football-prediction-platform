@@ -22,6 +22,7 @@ from engine.model.dixon_coles import (
     tau,
 )
 from engine.model.fit import (
+    MODEL_FAMILY,
     MODEL_VERSION,
     FitConfig,
     FittedModel,
@@ -48,21 +49,39 @@ from engine.model.poisson import (
     scoreline_matrix,
 )
 from engine.model.predict import Prediction, expected_goals, predict_fixture
+from engine.model.profiles import (
+    CONTROL,
+    DEFAULT_PROFILE,
+    EXPERIMENTAL,
+    PRODUCTION,
+    PRODUCTION_HALF_LIFE_DAYS,
+    PROFILES,
+    ModelProfile,
+    profile,
+)
 
 __all__ = [
     "BacktestConfig",
     "BacktestReport",
+    "CONTROL",
     "CalibrationRow",
+    "DEFAULT_PROFILE",
     "DecayConfig",
+    "EXPERIMENTAL",
     "FitConfig",
     "FittedModel",
     "InsufficientHistory",
     "InvalidRho",
     "MAX_GOALS",
+    "MODEL_FAMILY",
     "MODEL_VERSION",
     "MarketProbabilities",
     "MatchObservation",
+    "ModelProfile",
     "OUTCOMES",
+    "PRODUCTION",
+    "PRODUCTION_HALF_LIFE_DAYS",
+    "PROFILES",
     "Prediction",
     "ScoredPrediction",
     "ScorelineMatrix",
@@ -80,6 +99,7 @@ __all__ = [
     "outcome_of",
     "poisson_pmf",
     "predict_fixture",
+    "profile",
     "scoreline_matrix",
     "tau",
     "walk_forward",

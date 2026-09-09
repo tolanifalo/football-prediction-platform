@@ -621,9 +621,21 @@ try {
       plans.viaWrapper.includes("superseded_at"),
     plans.viaWrapper.replace(/\n/g, " | "),
   );
+  // The specific index NAME is deliberately not asserted here. The partial
+  // index covers exactly the rows where superseded_at IS NULL, so when
+  // little or nothing has been superseded it is the same size as the full
+  // fixture_id index and the planner may pick either - which is what
+  // happened once the six-season corpus landed and every one of its 2,280
+  // schedule rows was current. Index existence is asserted by check 84;
+  // what matters here is that a current-state lookup is an INDEX scan
+  // filtered on superseded_at and never a sequential scan.
   check(
-    "81. the partial current index serves a current-state lookup",
-    plans.currentLookup.includes("fixture_schedule_current_idx"),
+    "81. a current-state lookup uses an index on fixture_id, never a seq scan",
+    /Index (Only )?Scan using fixture_schedule_(current|fixture)_idx/.test(
+      plans.currentLookup,
+    ) &&
+      !plans.currentLookup.includes("Seq Scan on fixture_schedule") &&
+      plans.currentLookup.includes("superseded_at"),
     plans.currentLookup.replace(/\n/g, " | "),
   );
   check(

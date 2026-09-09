@@ -246,25 +246,38 @@ def main(argv: list[str] | None = None) -> int:
         description="Map football-data.co.uk provider keys to canonical entities."
     )
     parser.add_argument("--division", default="E0")
-    parser.add_argument("--season", default="2324")
+    parser.add_argument(
+        "--season",
+        action="append",
+        dest="seasons",
+        metavar="SEASON",
+        help="Provider season key, e.g. 2324. Repeat for several seasons; "
+             "each one is resolved as its own job run.",
+    )
     parser.add_argument("--database-url", default=None)
     args = parser.parse_args(argv)
 
+    seasons: list[str] = args.seasons or ["2324"]
+    exit_code = 0
     with psycopg.connect(args.database_url or database_url()) as conn:
-        report = run_resolution(
-            conn, division=args.division, season=args.season
-        )
-    print(f"job_run {report.job_run_id}: {report.status}")
-    print(f"  mappings created    {report.created}")
-    print(f"  mappings unchanged  {report.unchanged}")
-    print(f"  teams resolved      {report.resolved_teams}")
-    print(f"  conflicts           {report.conflicts}")
-    print(f"  ambiguous           {report.ambiguous}")
-    print(f"  unknown             {report.unknown}")
-    print(f"  review items filed  {report.review_items}")
-    for problem in report.problems[:10]:
-        print(f"  ! {problem}")
-    return 0 if report.status is RunStatus.OK else 1
+        for season in seasons:
+            print(f"=== {args.division} {season} ===")
+            report = run_resolution(
+                conn, division=args.division, season=season
+            )
+            print(f"job_run {report.job_run_id}: {report.status}")
+            print(f"  mappings created    {report.created}")
+            print(f"  mappings unchanged  {report.unchanged}")
+            print(f"  teams resolved      {report.resolved_teams}")
+            print(f"  conflicts           {report.conflicts}")
+            print(f"  ambiguous           {report.ambiguous}")
+            print(f"  unknown             {report.unknown}")
+            print(f"  review items filed  {report.review_items}")
+            for problem in report.problems[:10]:
+                print(f"  ! {problem}")
+            if report.status is not RunStatus.OK:
+                exit_code = 1
+    return exit_code
 
 
 if __name__ == "__main__":

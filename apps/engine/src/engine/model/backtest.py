@@ -26,6 +26,7 @@ Two baselines are computed alongside, both walk-forward on the same cutoffs:
 from __future__ import annotations
 
 import math
+from bisect import bisect_left
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -36,7 +37,6 @@ from engine.model.fit import (
     InsufficientHistory,
     MatchObservation,
     fit_poisson,
-    observations_before,
 )
 from engine.model.metrics import (
     OUTCOMES,
@@ -67,6 +67,7 @@ class BacktestConfig:
 @dataclass(frozen=True)
 class ScoredPrediction:
     kickoff: datetime
+    season: str
     home_team: str
     away_team: str
     probabilities: tuple[float, float, float]
@@ -166,13 +167,21 @@ def walk_forward(
     settings = config or BacktestConfig()
     ordered = sorted(observations, key=lambda o: (o.kickoff, o.home_team, o.away_team))
 
+    # The training set for a cutoff is a PREFIX of this list, because the list
+    # is sorted by kickoff. Finding it by bisection returns exactly what
+    # `observations_before` returns - the same objects in the same order - and
+    # a test asserts that on the real corpus. It is not an approximation of
+    # the cutoff; it is the same cutoff computed without re-sorting 2,280
+    # observations once per fixture.
+    kickoffs = [o.kickoff for o in ordered]
+
     fit_cache: dict[datetime, FittedModel] = {}
     scored: list[ScoredPrediction] = []
     skipped = 0
 
     for target in ordered:
         cutoff = target.kickoff
-        training = observations_before(ordered, cutoff)
+        training = ordered[: bisect_left(kickoffs, cutoff)]
         if len(training) < settings.min_training_matches:
             skipped += 1
             continue
@@ -200,6 +209,7 @@ def walk_forward(
         scored.append(
             ScoredPrediction(
                 kickoff=target.kickoff,
+                season=target.season,
                 home_team=target.home_team,
                 away_team=target.away_team,
                 probabilities=prediction.markets.one_x_two,

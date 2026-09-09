@@ -20,6 +20,7 @@ from engine.db import database_url
 from engine.ingestion.runs import RunStatus
 from engine.ingestion.transport import HttpxTransport
 from engine.jobs.import_football_data import run_import
+from engine.providers.football_data_couk.seed import E0_TEAMS
 
 SAMPLE = pathlib.Path(__file__).parent / "fixtures" / "E0_2324_sample.csv"
 
@@ -106,7 +107,9 @@ class TestVerticalSlice:
         assert after_first["countries"] == 1
         assert after_first["competitions"] == 1
         assert after_first["seasons"] == 1
-        assert after_first["teams"] == 20, "the seeded Premier League squad"
+        # The whole seeded squad is created regardless of how many of them
+        # appear in this sample: `teams` is a registry, not season-scoped.
+        assert after_first["teams"] == len(E0_TEAMS)
         assert after_first["bookmakers"] == 6
         assert after_first["odds_series"] > 0
         assert after_first["odds_ticks"] == after_first["odds_series"]

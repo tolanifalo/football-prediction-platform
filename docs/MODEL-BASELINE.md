@@ -1,10 +1,44 @@
-# The baseline prediction model — independent Poisson
+# The prediction model — independent Poisson
 
-**Phase 1, milestone 1.** Authoritative for the prediction engine's mathematics, cutoff policy and backtest methodology. Where it touches Phase 0 concepts — bitemporality, `is_trainable`, the as-of wrapper — `PHASE-0-SPEC.md` remains authoritative and this document consumes it.
+**Phase 1.** Authoritative for the prediction engine's mathematics, cutoff policy, backtest methodology and **which configuration is production**. Where it touches Phase 0 concepts — bitemporality, `is_trainable`, the as-of wrapper — `PHASE-0-SPEC.md` remains authoritative and this document consumes it.
 
-The first thing in this repository that predicts anything. Deliberately the simplest defensible football model, because **its job is to be beaten**: every later improvement — Dixon-Coles, time decay, xG, ensembles — has to justify itself against a transparent number produced under the same leakage discipline, and a baseline that was already clever would hide whether the improvement was real.
+**No migrations, no new tables.** The engine reads canonical facts and writes nothing. **No bookmaker odds are inputs to any configuration** — the 55,640 closing ticks in the database are deliberately outside the model, and a test asserts the package imports nothing odds-related.
 
-**No migrations, no new tables.** The engine reads canonical facts and writes nothing.
+## 0. The three configurations
+
+All three run the **same estimator, same parameterisation, same cold-start policy**. They differ only in configuration, which is why adopting a new default required no change to the mathematics. They live in `engine/model/profiles.py`, and that module is the only place "what production runs" is defined.
+
+| | profile | configuration | status |
+|---|---|---|---|
+| **PRODUCTION** | `production` | independent Poisson + **180-day exponential time decay** | **the default** |
+| **CONTROL** | `control` | independent **unweighted** Poisson | the frozen benchmark, kept forever |
+| **EXPERIMENTAL** | `dixon-coles`, `decay-30d`, `decay-90d`, `decay-365d`, `decay-365d-dixon-coles` | tested, **not adopted** | available, off by default |
+
+```
+uv run python -m engine.jobs.backtest_poisson                     # production
+uv run python -m engine.jobs.backtest_poisson --profile control   # the benchmark
+```
+
+**Dixon-Coles is not adopted.** Its implementation and formulation are unchanged and remain available as an experimental profile.
+
+### Why 180 days, and why it is not a knob
+
+Selected by a rule fixed **before** any held-out result was seen — log-loss gain ≥ 0.0050 with no material Brier regression — applied to the 2019/20–2022/23 development period, then confirmed once against 2023/24–2024/25 (`MULTI-SEASON-EVALUATION.md`).
+
+| | development (1,490) | held out (760) |
+|---|---|---|
+| control log loss | 1.0043 | 0.9840 |
+| **production log loss** | **0.9984** (−0.0059) | **0.9560** (−0.0280) |
+| control Brier | 0.5973 | 0.5865 |
+| **production Brier** | **0.5933** (−0.0040) | **0.5669** (−0.0196) |
+
+It improved **five of six seasons** individually, and cut the long-standing goal-rate bias from −0.287 to −0.091 on the held-out pair. The one regression is 2021/22.
+
+**No significance is claimed.** Six seasons of one league are not independent draws, the sample is 2,250 predictions, and the differences are small in absolute terms. The evidence is directional and was collected under a predeclared rule; that is the whole of the case.
+
+**The held-out seasons are now spent.** They were scored once, after selection. They are historical evaluation data from here on and **must not be used as a tuning set**; a future half-life question needs new data, not a re-read of these.
+
+**On one season, decay is roughly neutral** — on E0 2023/24 alone, production scores 0.9810 against control's 0.9802. That is expected and is not evidence against the adoption: the single-season regime is exactly the one `MODEL-EXPERIMENTS.md` measured, and the adoption rests on the multi-season result.
 
 ## 1. The leakage rule, which is the whole point
 
@@ -81,7 +115,9 @@ A fixture is skipped until the window holds **30 matches**. Two baselines are sc
 
 Both scoring rules are proper: **log loss** (unbounded, punishes confident misses) and the multiclass **Brier score** (0–2). Uniform thirds score 1.0986 and 0.6667.
 
-## 7. Results — Premier League 2023/24
+## 7. Results — Premier League 2023/24 (CONTROL profile)
+
+*These are the **control's** numbers and the frozen benchmark. A regression test and the `--profile control` job hold them here. Production's multi-season figures are in §0 and `MULTI-SEASON-EVALUATION.md`.*
 
 380 trainable results, 350 predictions, 214 fits, 4.2 seconds.
 
@@ -110,6 +146,8 @@ calibration     predicted   observed     bias
 **Cold start**: 11 of 350 predictions involved a cold-started team, all between 2 and 18 September. Excluding them changes the model's log loss from 0.9802 to 0.9767 over 339 predictions — slightly better, as expected.
 
 ## 8. Limitations, recorded
+
+**Production adds one limitation of its own:** a 180-day half-life discards older history deliberately, so a competition with a long stable regime and few matches per season would be weighted more aggressively than the evidence for 180 days covers. That evidence is one league, six seasons, 38 matches per club per season.
 
 **Goals are assumed independent.** They are not — draws and low scores are under-predicted by exactly this model, which is what the Dixon-Coles low-score correction exists to fix. Deliberately absent.
 

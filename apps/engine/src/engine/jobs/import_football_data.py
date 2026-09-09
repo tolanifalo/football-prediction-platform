@@ -57,7 +57,7 @@ from engine.providers.football_data_couk.catalog import (
     DIVISIONS,
     season_label,
 )
-from engine.providers.football_data_couk.seed import E0_2324_TEAMS
+from engine.providers.football_data_couk.seed import E0_TEAMS
 
 JOB_NAME = "ingest_football_data_couk"
 
@@ -192,7 +192,7 @@ def run_import(
         start_year, kickoffs[0].date() if kickoffs else None,
         kickoffs[-1].date() if kickoffs else None,
     )
-    for team_slug, team_name, team_aliases in E0_2324_TEAMS:
+    for team_slug, team_name, team_aliases in E0_TEAMS:
         seeder.team(team_slug, team_name, country_id, team_aliases, source_id)
     bookmaker_ids = {b.slug: seeder.bookmaker(b.slug, b.name) for b in BOOKMAKERS}
     alias_to_team = seeder.alias_index(source_id)
@@ -273,28 +273,55 @@ def run_import(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Import one football-data.co.uk file.")
+    parser = argparse.ArgumentParser(
+        description="Import one or more football-data.co.uk season files."
+    )
     parser.add_argument("--division", default="E0")
-    parser.add_argument("--season", default="2324")
+    parser.add_argument(
+        "--season",
+        action="append",
+        dest="seasons",
+        metavar="SEASON",
+        help="Provider season key, e.g. 2324. Repeat for several seasons; "
+             "each one is downloaded, archived and imported as its own job run.",
+    )
     parser.add_argument("--database-url", default=None)
     args = parser.parse_args(argv)
 
+    # ONE JOB RUN PER SCOPE, and one transport for the whole invocation so a
+    # six-season import reuses the connection pool rather than opening six.
+    # A season that fails does not stop the ones after it: they are separate
+    # scopes with separate evidence, and a partial corpus is reported, never
+    # silently completed.
+    seasons: list[str] = args.seasons or ["2324"]
     transport = HttpxTransport(BASE_URL)
+    exit_code = 0
     with psycopg.connect(args.database_url or database_url()) as conn:
-        report = run_import(
-            conn, division=args.division, season=args.season, transport=transport
-        )
-
-    print(f"job_run {report.job_run_id}: {report.status}")
-    print(f"  fixtures        {report.fixtures}")
-    print(f"  schedules       {report.schedules_written}")
-    print(f"  results         {report.results_written}")
-    print(f"  match_stats     {report.stats_written}")
-    print(f"  odds_series     {report.series}")
-    print(f"  odds_ticks      {report.ticks_written}")
-    if report.unresolved_teams:
-        print(f"  UNRESOLVED      {report.unresolved_teams}")
-    return 0 if report.status is RunStatus.OK else 1
+        for season in seasons:
+            print(f"=== {args.division} {season} ===")
+            try:
+                report = run_import(
+                    conn,
+                    division=args.division,
+                    season=season,
+                    transport=transport,
+                )
+            except SystemExit as exc:
+                print(f"  REFUSED: {exc}", file=sys.stderr)
+                exit_code = 1
+                continue
+            print(f"job_run {report.job_run_id}: {report.status}")
+            print(f"  fixtures        {report.fixtures}")
+            print(f"  schedules       {report.schedules_written}")
+            print(f"  results         {report.results_written}")
+            print(f"  match_stats     {report.stats_written}")
+            print(f"  odds_series     {report.series}")
+            print(f"  odds_ticks      {report.ticks_written}")
+            if report.unresolved_teams:
+                print(f"  UNRESOLVED      {report.unresolved_teams}")
+            if report.status is not RunStatus.OK:
+                exit_code = 1
+    return exit_code
 
 
 if __name__ == "__main__":

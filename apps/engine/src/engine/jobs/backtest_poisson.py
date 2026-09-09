@@ -17,13 +17,14 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import psycopg
 
 from engine.db import database_url
 from engine.model.backtest import BacktestConfig, BacktestReport, walk_forward
-from engine.model.fit import FitConfig
+from engine.model.profiles import DEFAULT_PROFILE, PROFILES, profile
 from engine.model.repository import load_observations
 
 
@@ -70,6 +71,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Walk-forward Poisson backtest.")
     parser.add_argument("--competition", default="england-premier-league")
     parser.add_argument("--season", default="2023/24")
+    parser.add_argument(
+        "--profile",
+        default=DEFAULT_PROFILE.name,
+        choices=sorted(PROFILES),
+        help="Named model configuration. Defaults to production "
+             "(180-day decay); pass 'control' for the frozen unweighted "
+             "benchmark.",
+    )
     parser.add_argument("--min-training-matches", type=int, default=30)
     parser.add_argument("--ridge", type=float, default=0.05)
     parser.add_argument("--min-matches", type=int, default=4)
@@ -92,21 +101,32 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no trainable results for {scope}", file=sys.stderr)
         return 1
 
+    # The profile decides the MODEL; ridge and cold-start remain per-run knobs
+    # shared by every profile, so overriding them does not silently produce a
+    # different model under a profile's name.
+    chosen = profile(args.profile)
+    fit = replace(
+        chosen.fit, ridge=args.ridge, min_matches=args.min_matches
+    )
     report = walk_forward(
         observations,
         as_of=as_of,
         scope=scope,
         config=BacktestConfig(
             min_training_matches=args.min_training_matches,
-            fit=FitConfig(ridge=args.ridge, min_matches=args.min_matches),
+            fit=fit,
             skip_cold_start=args.skip_cold_start,
         ),
     )
 
     if args.json:
-        print(json.dumps(report.as_metadata(), indent=2, sort_keys=True))
+        print(json.dumps(
+            {**report.as_metadata(), "model": chosen.as_metadata()},
+            indent=2, sort_keys=True,
+        ))
     else:
         print(f"loaded               {len(observations)} trainable results")
+        print(f"model                {chosen.name} - {chosen.description}")
         _print_report(report, scope)
     return 0
 
